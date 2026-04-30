@@ -37,6 +37,7 @@ project:
       children:
         - file: optimization/binary_model.ipynb
         - file: optimization/qaoa_graph_partition.ipynb
+        - file: optimization/cvar_assisted_custom_penalty.ipynb
     - title: コラボレーション
       file: collaboration/index.md
       children:
