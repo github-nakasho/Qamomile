@@ -6,11 +6,11 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.1
+#       jupytext_version: 1.19.5
 #   kernelspec:
-#     display_name: Python (qamomile)
+#     display_name: qamomile (3.11.16.final.0)
 #     language: python
-#     name: qamomile
+#     name: python3
 # ---
 
 # %% [markdown]
@@ -32,10 +32,8 @@
 # %%
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import qamomile.circuit as qmc
-from qamomile.circuit.algorithm.state_preparation import amplitude_encoding
-from qamomile.circuit.stdlib.qft import iqft
+from qamomile.circuit.stdlib import iqft, ripple_carry_add
 from qamomile.qiskit import QiskitTranspiler
 from scipy.stats import norm
 
@@ -212,26 +210,21 @@ from scipy.stats import norm
 # %% [markdown]
 # ## Qamomileによる実装
 #
-# それでは、[Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) の実装を見ていきましょう。
+# それでは [Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) で提案された手法を、Qamomile で実装しましょう。
 #
 # ### 古典コンピュータによる処理
 #
-# まず、量子回路に渡す全てのパラメータを、古典コンピュータ上で事前計算する関数を定義します。
-# 簡単のため、ここで量子回路に渡す分布は正規分布とします。
-# `make_normal_amplitudes` では正規分布を $N=2^n$ の点で離散化し、振幅符号化に必要な $\sqrt{p_i}$ を準備します。
-# `make_objective_angles_comparator` は、VaR 計算で必要となる $f(i) = \mathbf{1} [i \leq \ell] $ を準備します。
-# ただし、量子回路上では補助量子ビットへの回転角 $\theta_i$ を通してこれを実現するため、$\sin^2 (\theta_i / 2) = 1$ となる角度 $\theta_i = \pi$ と $\theta_i = 0$ をリストに格納しています。
-# `make_objective_angles_cvar` では、続く CVaR 計算で必要な $f(i) = \frac{i}{\ell_\alpha} \mathbf{1} [i \leq \ell_\alpha]$ の計算を行っています。
-# 補助量子ビットが $\vert 1 \rangle$ になる確率を $f(i)$ に一致させるため
+# 確率分布として、正規分布を $N = 2^n$ 点で離散化し、振幅符号化に必要な $\sqrt{p_i}$ を準備しましょう。
+# また、[Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) での最小 depth の場合、$u=0$ では $\zeta(y) \simeq y - \frac{1}{2}$ となります。
+# 主要項だけ見ると、推定誤差はおよそ 
 #
 # $$
-# f(i) 
-# = \sin^2 \frac{\theta_i}{2} \ \Longrightarrow \ 
-# \theta_i 
-# = 2 \mathrm{arcsin} \sqrt{\frac{i}{\ell_\alpha}} \tag{10}
+# \epsilon (c) 
+# \simeq \frac{\pi}{Mc} + \frac{c^2}{6} \tag{13}
 # $$
 #
-# としています。
+# です。
+# これを最小化する $c \simeq \left( \frac{3\pi}{M}\right)^{1/3}$ を利用し、$c \leq 1$ に制限します。
 
 # %%
 # ===================================================
@@ -240,260 +233,494 @@ from scipy.stats import norm
 
 def make_normal_amplitudes(n: int, mu: float = 0.0, sigma: float = 1.0) -> np.ndarray:
     N = 2 ** n
-    x = np.linspace(mu - 3*sigma, mu + 3*sigma, N)
+    x = np.linspace(mu - 3 * sigma, mu + 3 * sigma, N)
     probs = norm.pdf(x, mu, sigma)
     probs /= probs.sum()
     return np.sqrt(probs)
 
-def make_objective_angles_comparator(n: int, l: int) -> list[float]:
-    return [float(np.pi) if i <= l else 0.0 for i in range(2**n)]
 
-def make_objective_angles_cvar(
-    n: int, l_alpha: int, mu: float, sigma: float,
-) -> list[float]:
-    N = 2 ** n
-    x_vals = np.linspace(mu - 3*sigma, mu + 3*sigma, N)
-    x_min, x_max = x_vals[0], x_vals[-1]
-    angles = []
-    for i in range(N):
-        if i <= l_alpha:
-            fi = (x_vals[i] - x_min) / (x_max - x_min)
-            fi = min(max(fi, 0.0), 1.0)
-            angles.append(float(2 * np.arcsin(np.sqrt(fi))))
-        else:
-            angles.append(0.0)
-    return angles
+def choose_u0_scaling_c(m: int) -> float:
+    """Woerner--Egger の u=0 近似で用いる scaling c を選ぶ。"""
+    M = 2 ** m
+    return float(min(1.0, (3.0 * np.pi / M) ** (1.0 / 3.0)))
 
 
 # %% [markdown]
 # ### カーネルの合成
 #
-# 次に、Qamomileを用いて量子演算を実装しましょう。
-# `_identity` は、のちに必要となる恒等演算を行うだけの関数です。
-# `merge_kernels` 関数は、2つのカーネル `left` と `right` を受け取り、それらを合成します。
-# `build_objective_kernel` では、$2^n$ 個のカーネルリスト `op_list` を、`merge_kernels` を繰り返し適用することで1つのカーネルに統合します。
+# QAE の Grover 演算子 $Q$ を繰り返し適用するため、Qamomile カーネルを順に合成する補助関数を定義しましょう。
+# 今回の $A$ は、分布レジスタ `q` に加えて comparator の定数レジスタ `const`、ripple-carry 用の `carry` と `overflow`、CVaR の条件判定を保持する `flag`、そして QAE が「good state」を判定する `anc` を受け取ります。すべての workspace は objective の最後に $\lvert0\rangle$ へ戻すため、$A^\dagger$ も Qamomile の `qmc.inverse` で構成できます。
 
 # %%
 # ===================================================
-# Step 1: identity カーネル
+# Step 1: カーネル合成ユーティリティ
 # ===================================================
 
-@qmc.qkernel
-def _identity(
-    q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
-    return q, anc
-
-# ===================================================
-# Step 2: カーネルの合成ユーティリティ
-# ===================================================
-
-def merge_kernels(left, right):
+def merge_system_kernels(left, right):
     @qmc.qkernel
     def merged(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
-        q, anc = left(q, anc)
-        q, anc = right(q, anc)
-        return q, anc
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        q, const, carry, overflow, flag, anc = left(
+            q, const, carry, overflow, flag, anc
+        )
+        q, const, carry, overflow, flag, anc = right(
+            q, const, carry, overflow, flag, anc
+        )
+        return q, const, carry, overflow, flag, anc
+
     return merged
 
-def build_objective_kernel(op_list: list):
-    ops = list(op_list)
-    while len(ops) > 1:
-        next_ops = []
-        for i in range(0, len(ops), 2):
-            if i + 1 < len(ops):
-                next_ops.append(merge_kernels(ops[i], ops[i + 1]))
-            else:
-                next_ops.append(ops[i])
-        ops = next_ops
-    return ops[0]
+
+@qmc.qkernel
+def _identity_const(
+    const: qmc.Vector[qmc.Qubit],
+) -> qmc.Vector[qmc.Qubit]:
+    return const
+
+
+def make_const_x_kernel(bit: int):
+    @qmc.qkernel
+    def x_const(
+        const: qmc.Vector[qmc.Qubit],
+    ) -> qmc.Vector[qmc.Qubit]:
+        const[bit] = qmc.x(const[bit])
+        return const
+
+    return x_const
+
+
+def merge_const_kernels(left, right):
+    @qmc.qkernel
+    def merged_const(
+        const: qmc.Vector[qmc.Qubit],
+    ) -> qmc.Vector[qmc.Qubit]:
+        const = left(const)
+        const = right(const)
+        return const
+
+    return merged_const
+
+
+def make_prepare_constant_kernel(n: int, value: int):
+    """|0...0> -> |value> を X ゲートだけで構成する。little-endian。"""
+    one_bits = [bit for bit in range(n) if (value >> bit) & 1]
+    if not one_bits:
+        return _identity_const
+
+    kernel = make_const_x_kernel(one_bits[0])
+    for bit in one_bits[1:]:
+        kernel = merge_const_kernels(kernel, make_const_x_kernel(bit))
+    return kernel
+
 
 
 # %% [markdown]
 # ### 目標演算子 $F$ の実装
 #
-# ここでは、式(2)の演算子 $F$ を実装します。
-# 多制御 $R_y$ ゲート演算のためのカーネルを構築しますが、もし対応する角度が $\vert \theta \vert < \epsilon$ の場合には、回転を行わずに恒等演算を施すようにしています。
-# 普通の多制御 $R_y$ 回転は、制御量子ビットが全て $\vert 1 \rangle$ のときのみ、ターゲット量子ビットを回転させます。
-# しかし今回必要なのは、例えば$\vert i=5 \rangle = \vert 101 \rangle$ に対応した角度 $\theta_5$ の回転です。
-# よって全ての制御量子ビットを $\vert 11 \cdots 1 \rangle$ に揃えるための $X$ フリップを行い、そこに対応する多制御 $R_y$ を施したのちに、再び $X$ フリップを行うことで制御量子ビット状態を元に戻す、という操作を実装しています。
+# Qamomile の `ripple_carry_add` を用い、$i \leq \ell$ を判定する comparator を構成します。
+# VaR ではこの比較結果をそのままアンシラ量子ビットに記録し、$P[X \leq \ell]$ を QAE で推定できるようにします。
+# CVaR では比較結果を `flag` として利用し、テイル領域にのみ、[Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) の $u = 0$ のテイラー展開近似による制御 $R_y$ 回転を適用します。
 
 # %%
-eps = 1e-12
-
 # ===================================================
-# Step 3: 1基底分のカーネルを生成
+# Step 2: ripple-carry comparator と Woerner--Egger 型 efficient F
 # ===================================================
 
-def make_x_kernel(b: int):
-    @qmc.qkernel
-    def x_op(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
-        q[b] = qmc.x(q[b])
-        return q, anc
-    return x_op
-
-def make_single_op_kernel(n: int, bits_to_flip: list[int], angle: float):
-    mcry = qmc.control(qmc.ry, num_controls=n)
-    a = float(angle)
-    if len(bits_to_flip) == 0:
-        flip_kernel = _identity
-    else:
-        x_kernels = [make_x_kernel(b) for b in bits_to_flip]
-        flip_kernel = x_kernels[0]
-        for xk in x_kernels[1:]:
-            flip_kernel = merge_kernels(flip_kernel, xk)
+def make_comparator_arithmetic(n: int, l: int):
+    """comparator で使う定数準備・加算・逆加算をまとめて作る。"""
+    offset = 2 ** n - 1 - l
+    prepare_const = make_prepare_constant_kernel(n, offset)
 
     @qmc.qkernel
-    def mcry_kernel(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
-        q, anc = mcry(q, anc, angle=a)
-        return q, anc
+    def add_offset(
+        const: qmc.Vector[qmc.Qubit],
+        q: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        const, q, carry, overflow = ripple_carry_add(
+            const, q, carry, overflow
+        )
+        return const, q, carry, overflow
 
-    return merge_kernels(merge_kernels(flip_kernel, mcry_kernel), flip_kernel)
+    add_offset_dag = qmc.inverse(add_offset)
+    return prepare_const, add_offset, add_offset_dag
 
-def make_all_op_kernels(n: int, obj_angles: list[float]) -> list:
-    N = 2 ** n
-    kernels = []
-    for i in range(N):
-        angle = obj_angles[i]
-        active = (angle > eps) or (angle < -eps)
-        if active:
-            bits_to_flip = [bit for bit in range(n) if not (i >> bit) & 1]
-            kernels.append(make_single_op_kernel(n, bits_to_flip, angle))
-        else:
-            kernels.append(_identity)
-    return kernels
+
+def make_var_objective_kernel(n: int, l: int):
+    """anc ^= 1[q <= l]。すべての workspace は最後に |0> へ戻す。"""
+    prepare_const, add_offset, add_offset_dag = make_comparator_arithmetic(n, l)
+
+    @qmc.qkernel
+    def objective(
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        const = prepare_const(const)
+        const, q, carry, overflow = add_offset(
+            const, q, carry, overflow
+        )
+
+        # overflow = 0 <=> q <= l
+        anc = qmc.x(anc)
+        overflow, anc = qmc.cx(overflow, anc)
+
+        # arithmetic workspace を uncompute
+        const, q, carry, overflow = add_offset_dag(
+            const, q, carry, overflow
+        )
+        const = prepare_const(const)
+        return q, const, carry, overflow, flag, anc
+
+    return objective
+
+
+def make_leq_flag_kernel(n: int, l: int):
+    """flag ^= 1[q <= l]。すべての arithmetic workspace は元に戻す。"""
+    prepare_const, add_offset, add_offset_dag = make_comparator_arithmetic(n, l)
+
+    @qmc.qkernel
+    def comparator(
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        const = prepare_const(const)
+        const, q, carry, overflow = add_offset(
+            const, q, carry, overflow
+        )
+
+        flag = qmc.x(flag)
+        overflow, flag = qmc.cx(overflow, flag)
+
+        const, q, carry, overflow = add_offset_dag(
+            const, q, carry, overflow
+        )
+        const = prepare_const(const)
+        return q, const, carry, overflow, flag, anc
+
+    return comparator
+
+
+def make_cvar_objective_kernel(n: int, l_alpha: int, c: float):
+    """Woerner--Egger の u=0 Taylor 近似を用いた CVaR objective。"""
+    if l_alpha <= 0:
+        raise ValueError("l_alpha must be positive for the CVaR objective kernel")
+
+    comparator = make_leq_flag_kernel(n, l_alpha)
+    cry = qmc.control(qmc.ry)
+    ccry = qmc.control(qmc.ry, num_controls=2)
+
+    base_angle = float(np.pi / 2.0 - c)
+    bit_angles = [float(2.0 * c * (2 ** bit) / l_alpha) for bit in range(n)]
+
+    @qmc.qkernel
+    def base_rotation(
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        flag, anc = cry(flag, anc, angle=base_angle)
+        return q, const, carry, overflow, flag, anc
+
+    def make_bit_rotation(bit: int, angle: float):
+        @qmc.qkernel
+        def bit_rotation(
+            q: qmc.Vector[qmc.Qubit],
+            const: qmc.Vector[qmc.Qubit],
+            carry: qmc.Qubit,
+            overflow: qmc.Qubit,
+            flag: qmc.Qubit,
+            anc: qmc.Qubit,
+        ) -> tuple[
+            qmc.Vector[qmc.Qubit],
+            qmc.Vector[qmc.Qubit],
+            qmc.Qubit,
+            qmc.Qubit,
+            qmc.Qubit,
+            qmc.Qubit,
+        ]:
+            flag, q[bit], anc = ccry(flag, q[bit], anc, angle=angle)
+            return q, const, carry, overflow, flag, anc
+
+        return bit_rotation
+
+    rotation_kernel = base_rotation
+    for bit, angle in enumerate(bit_angles):
+        rotation_kernel = merge_system_kernels(
+            rotation_kernel,
+            make_bit_rotation(bit, angle),
+        )
+
+    @qmc.qkernel
+    def objective(
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        # flag = 1[q <= l_alpha]
+        q, const, carry, overflow, flag, anc = comparator(
+            q, const, carry, overflow, flag, anc
+        )
+
+        # tail 領域だけ efficient F を作用
+        q, const, carry, overflow, flag, anc = rotation_kernel(
+            q, const, carry, overflow, flag, anc
+        )
+
+        # flag を |0> に戻す
+        q, const, carry, overflow, flag, anc = comparator(
+            q, const, carry, overflow, flag, anc
+        )
+        return q, const, carry, overflow, flag, anc
+
+    return objective
+
 
 
 # %% [markdown]
 # ### 量子振幅推定の実装
 #
-# Groverの反射演算子 $\mathcal{Q}$ を量子位相推定 (QPE) にかけることで、振幅を推定するカーネルを実装しましょう。
-# この振幅推定により、$\mathbb{E}[f(X)]$ を推定したことになります。
+# 先ほど作成した VaR / CVaR のための $F$ を用いて、実際に QAE を構築しましょう。
+# 確率分布の振幅符号化と $F$ を組み合わせて、状態準備演算子 $\mathcal{A}$ を構成し、そこから QAE のための Grover 演算子 $\mathcal{Q} = \mathcal{A} S_0 \mathcal{A}^\dagger S_\chi$ を作ります。
 
 # %%
 # ===================================================
-# Step 4: Fully QAE
+# Step 3: Fully QAE
 # ===================================================
 
-def make_a_kernel(n: int, amplitudes: np.ndarray, obj_angles: list[float]):
+def make_a_kernel(n: int, amplitudes: np.ndarray, objective_kernel):
     """A = F · R カーネル"""
-    op_list = make_all_op_kernels(n, obj_angles)
-    objective_kernel = build_objective_kernel(op_list)
 
     @qmc.qkernel
     def a_kernel(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
-        q = amplitude_encoding(q, amplitudes)
-        q, anc = objective_kernel(q, anc)
-        return q, anc
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        q = qmc.amplitude_encoding(q, amplitudes)
+        q, const, carry, overflow, flag, anc = objective_kernel(
+            q, const, carry, overflow, flag, anc
+        )
+        return q, const, carry, overflow, flag, anc
 
     return a_kernel
 
-def make_grover_q_kernel(n: int, a_ker, a_dag):
-    """
-    Grover 反射演算子 Q = A · S₀ · A† · Sχ
 
-    Sχ に X→Z→X を使用。
-    Z のみでは Q の固有値が -e^{±2iθ} になり QPE の位相が
-    π ± 2θ にシフトするため、X→Z→X で符号を打ち消す。
-    """
+def make_grover_q_kernel(n: int, a_ker, a_dag):
+    """Grover 反射演算子 Q = A · S0 · A† · Schi"""
+
     @qmc.qkernel
     def s_chi(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
         anc = qmc.x(anc)
         anc = qmc.z(anc)
         anc = qmc.x(anc)
-        return q, anc
+        return q, const, carry, overflow, flag, anc
 
-    mcz_n = qmc.control(qmc.z, num_controls=n)
+    # controls = q(n) + const(n) + carry + overflow + flag = 2n+3
+    mcz_all = qmc.control(qmc.z, num_controls=2 * n + 3)
 
     @qmc.qkernel
-    def x_anc_kernel(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
+    def s_0(
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        q = qmc.x(q)
+        const = qmc.x(const)
+        carry = qmc.x(carry)
+        overflow = qmc.x(overflow)
+        flag = qmc.x(flag)
         anc = qmc.x(anc)
-        return q, anc
 
-    x_q_kernels = [make_x_kernel(b) for b in range(n)]
-    x_all_q = x_q_kernels[0]
-    for xk in x_q_kernels[1:]:
-        x_all_q = merge_kernels(x_all_q, xk)
-    x_all = merge_kernels(x_all_q, x_anc_kernel)
+        q, const, carry, overflow, flag, anc = mcz_all(
+            q, const, carry, overflow, flag, anc
+        )
+
+        q = qmc.x(q)
+        const = qmc.x(const)
+        carry = qmc.x(carry)
+        overflow = qmc.x(overflow)
+        flag = qmc.x(flag)
+        anc = qmc.x(anc)
+        return q, const, carry, overflow, flag, anc
 
     @qmc.qkernel
-    def mcz_kernel(
-        q: qmc.Vector[qmc.Qubit], anc: qmc.Qubit,
-    ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Qubit]:
-        q, anc = mcz_n(q, anc)
-        return q, anc
+    def q_kernel(
+        q: qmc.Vector[qmc.Qubit],
+        const: qmc.Vector[qmc.Qubit],
+        carry: qmc.Qubit,
+        overflow: qmc.Qubit,
+        flag: qmc.Qubit,
+        anc: qmc.Qubit,
+    ) -> tuple[
+        qmc.Vector[qmc.Qubit],
+        qmc.Vector[qmc.Qubit],
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+        qmc.Qubit,
+    ]:
+        q, const, carry, overflow, flag, anc = s_chi(
+            q, const, carry, overflow, flag, anc
+        )
+        q, const, carry, overflow, flag, anc = a_dag(
+            q, const, carry, overflow, flag, anc
+        )
+        q, const, carry, overflow, flag, anc = s_0(
+            q, const, carry, overflow, flag, anc
+        )
+        q, const, carry, overflow, flag, anc = a_ker(
+            q, const, carry, overflow, flag, anc
+        )
+        return q, const, carry, overflow, flag, anc
 
-    s_0 = merge_kernels(merge_kernels(x_all, mcz_kernel), x_all)
+    return q_kernel
 
-    return merge_kernels(
-        merge_kernels(merge_kernels(s_chi, a_dag), s_0),
-        a_ker,
-    )
 
 def make_q_power_kernel(q_kernel, power: int):
     if power == 1:
         return q_kernel
+
     result = q_kernel
     for _ in range(power - 1):
-        result = merge_kernels(result, q_kernel)
+        result = merge_system_kernels(result, q_kernel)
     return result
 
+
 def make_qae_kernel(
-    n: int, m: int,
+    n: int,
+    m: int,
     amplitudes: np.ndarray,
-    obj_angles: list[float],
+    objective_kernel,
 ):
-    """
-    QAE カーネル
-
-    Step 2 の build_objective_kernel と同じ二分木合成を
-    QPE ステップにも適用することで if/elif を排除。
-
-    各 QPE ステップ（H + ctrl-Q^{2^k}）を make_qpe_step で
-    個別カーネルとして生成し、build_qpe_kernel で二分木合成する。
-    """
-    a_ker = make_a_kernel(n, amplitudes, obj_angles)
+    a_ker = make_a_kernel(n, amplitudes, objective_kernel)
     a_dag = qmc.inverse(a_ker)
     q_ker = make_grover_q_kernel(n, a_ker, a_dag)
 
-    # ---------------------------------------------------
-    # QPE ステップ用の合成ユーティリティ
-    # ---------------------------------------------------
-
     def merge_qpe_steps(left, right):
-        """
-        2つの QPE ステップカーネルを順に適用するカーネルを返す。
-        引数形式：(sv, q, anc) → (sv, q, anc)
-        """
         @qmc.qkernel
         def merged_step(
-            sv:  qmc.Vector[qmc.Qubit],
-            q:   qmc.Vector[qmc.Qubit],
+            sv: qmc.Vector[qmc.Qubit],
+            q: qmc.Vector[qmc.Qubit],
+            const: qmc.Vector[qmc.Qubit],
+            carry: qmc.Qubit,
+            overflow: qmc.Qubit,
+            flag: qmc.Qubit,
             anc: qmc.Qubit,
-        ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Vector[qmc.Qubit], qmc.Qubit]:
-            sv, q, anc = left(sv, q, anc)
-            sv, q, anc = right(sv, q, anc)
-            return sv, q, anc
+        ) -> tuple[
+            qmc.Vector[qmc.Qubit],
+            qmc.Vector[qmc.Qubit],
+            qmc.Vector[qmc.Qubit],
+            qmc.Qubit,
+            qmc.Qubit,
+            qmc.Qubit,
+            qmc.Qubit,
+        ]:
+            sv, q, const, carry, overflow, flag, anc = left(
+                sv, q, const, carry, overflow, flag, anc
+            )
+            sv, q, const, carry, overflow, flag, anc = right(
+                sv, q, const, carry, overflow, flag, anc
+            )
+            return sv, q, const, carry, overflow, flag, anc
+
         return merged_step
 
     def build_qpe_kernel(step_list: list):
-        """
-        step_list（長さ m）の QPE ステップカーネルを
-        二分木合成で1つのカーネルに統合する。
-        build_objective_kernel と全く同じ構造。
-        """
         steps = list(step_list)
         while len(steps) > 1:
             next_steps = []
@@ -505,69 +732,76 @@ def make_qae_kernel(
             steps = next_steps
         return steps[0]
 
-    # ---------------------------------------------------
-    # k 番目の QPE ステップカーネルを生成
-    # H(sv[k]) → ctrl-Q^{2^k}(sv[k], q, anc)
-    # ---------------------------------------------------
-
     def make_qpe_step(k: int):
-        cqk = qmc.control(make_q_power_kernel(q_ker, 2**k))
-        sk  = k
+        cqk = qmc.control(make_q_power_kernel(q_ker, 2 ** k))
+        sk = k
 
         @qmc.qkernel
         def qpe_step(
-            sv:  qmc.Vector[qmc.Qubit],
-            q:   qmc.Vector[qmc.Qubit],
+            sv: qmc.Vector[qmc.Qubit],
+            q: qmc.Vector[qmc.Qubit],
+            const: qmc.Vector[qmc.Qubit],
+            carry: qmc.Qubit,
+            overflow: qmc.Qubit,
+            flag: qmc.Qubit,
             anc: qmc.Qubit,
-        ) -> tuple[qmc.Vector[qmc.Qubit], qmc.Vector[qmc.Qubit], qmc.Qubit]:
+        ) -> tuple[
+            qmc.Vector[qmc.Qubit],
+            qmc.Vector[qmc.Qubit],
+            qmc.Vector[qmc.Qubit],
+            qmc.Qubit,
+            qmc.Qubit,
+            qmc.Qubit,
+            qmc.Qubit,
+        ]:
             sv[sk] = qmc.h(sv[sk])
-            sv[sk], q, anc = cqk(sv[sk], q, anc)
-            return sv, q, anc
+            sv[sk], q, const, carry, overflow, flag, anc = cqk(
+                sv[sk], q, const, carry, overflow, flag, anc
+            )
+            return sv, q, const, carry, overflow, flag, anc
 
         return qpe_step
 
-    # m 個の QPE ステップを生成して二分木合成
     step_kernels = [make_qpe_step(k) for k in range(m)]
-    qpe_kernel   = build_qpe_kernel(step_kernels)
-
-    # ---------------------------------------------------
-    # メインの QAE カーネル
-    #
-    # 構造：
-    #   1. A でメインレジスタを初期化
-    #   2. QPE（m ステップを qpe_kernel として一括適用）
-    #   3. IQFT を sv に適用
-    #   4. sv を測定
-    # ---------------------------------------------------
+    qpe_kernel = build_qpe_kernel(step_kernels)
 
     @qmc.qkernel
     def qae_kernel() -> qmc.Vector[qmc.Bit]:
-        q   = qmc.qubit_array(n, name="q")
+        q = qmc.qubit_array(n, name="q")
+        const = qmc.qubit_array(n, name="const")
+        carry = qmc.qubit(name="carry")
+        overflow = qmc.qubit(name="overflow")
+        flag = qmc.qubit(name="flag")
         anc = qmc.qubit(name="anc")
-        sv  = qmc.qubit_array(m, name="sv")
+        sv = qmc.qubit_array(m, name="sv")
 
-        q, anc = a_ker(q, anc)              # A でメインレジスタを初期化
-        sv, q, anc = qpe_kernel(sv, q, anc)  # QPE（全 m ステップ）
-        sv = iqft(sv)                        # 逆 QFT
-        return qmc.measure(sv)               # sv を測定
+        q, const, carry, overflow, flag, anc = a_ker(
+            q, const, carry, overflow, flag, anc
+        )
+        sv, q, const, carry, overflow, flag, anc = qpe_kernel(
+            sv, q, const, carry, overflow, flag, anc
+        )
+        sv = iqft(sv)
+        return qmc.measure(sv)
 
     return qae_kernel
-    
+
+
 def estimate_amplitude_qae(
-    n: int, m: int,
+    n: int,
+    m: int,
     amplitudes: np.ndarray,
-    obj_angles: list[float],
+    objective_kernel,
     shots: int = 4096,
 ) -> float:
     M = 2 ** m
     transpiler = QiskitTranspiler()
-    kernel = make_qae_kernel(n, m, amplitudes, obj_angles)
+    kernel = make_qae_kernel(n, m, amplitudes, objective_kernel)
     exe = transpiler.transpile(kernel)
     result = exe.sample(transpiler.executor(), shots=shots).result()
 
     counts: dict[int, int] = {}
     for outcome, count in result.results:
-        # qmc.Vector[qmc.Bit] の測定結果はタプルまたはネストしたタプルで返る
         if isinstance(outcome, (int, np.integer)):
             y = int(outcome)
         elif isinstance(outcome, tuple):
@@ -577,7 +811,7 @@ def estimate_amplitude_qae(
                     flat.extend(int(x) for x in b)
                 else:
                     flat.append(int(b))
-            y = sum(bit * (2**k) for k, bit in enumerate(flat))
+            y = sum(bit * (2 ** k) for k, bit in enumerate(flat))
         else:
             y = int(outcome)
         counts[y] = counts.get(y, 0) + count
@@ -589,94 +823,138 @@ def estimate_amplitude_qae(
     return float(np.sin(y_star * np.pi / M) ** 2)
 
 
+
 # %% [markdown]
 # ### VaRとCVaRの計算
 #
 # QAEによる $P[X \leq \ell]$ の推定と、二部探索を組合せることで、$\mathrm{VaR}_\alpha$ を求めましょう。
 # 各ステップで中間点 $\ell_\mathrm{mid}$ の累積確率を QAE で推定し、$1-\alpha$ との大小比較から探索範囲を縮小していきます。
-# このようにして VaR の計算を行い、さらに VaR 計算で得た数値から CVaR の計算も行います。
-# CVaR の計算には、追加の QAE を1回実行します。
+# CVaR 計算では、その VaR 以下の領域に $u = 0$ の $F$ を適用し、 さらに QAE を用います。
 
 # %%
 # ===================================================
-# Step 5: VaR の計算
+# Step 4: VaR の計算
 # ===================================================
 
 def compute_var(
-    alpha: float, n: int, m: int,
+    alpha: float,
+    n: int,
+    m: int,
     amplitudes: np.ndarray,
-    mu: float, sigma: float,
+    mu: float,
+    sigma: float,
     shots: int = 4096,
 ) -> tuple[int, float, float]:
-    """
-    完全 QAE による二分探索で VaR_α を計算する。
-
-    n 回の二分探索 × 各ステップで QAE を1回実行。
-    合計 n+1 回の QAE で VaR と P[X ≤ VaR] を求める。
-    """
+    """alpha を信頼水準として、下側 (1-alpha) 分位点を QAE で求める。"""
     N = 2 ** n
-    x_vals = np.linspace(mu - 3*sigma, mu + 3*sigma, N)
-    l_low, l_high = 0, N - 1
+    tail_prob = 1.0 - alpha
+    x_vals = np.linspace(mu - 3 * sigma, mu + 3 * sigma, N)
 
-    print(f"  VaR 計算開始（n={n}, m={m}, N={N}, M={2**m}）")
-    for step in range(n):
+    l_low, l_high = 0, N - 1
+    step = 0
+
+    print(
+        f"  VaR 計算開始（confidence={alpha:.1%}, tail={tail_prob:.1%}, "
+        f"n={n}, m={m}, N={N}, M={2**m}）"
+    )
+
+    while l_low < l_high:
+        step += 1
         l_mid = (l_low + l_high) // 2
-        obj_angles = make_objective_angles_comparator(n, l_mid)
-        prob = estimate_amplitude_qae(n, m, amplitudes, obj_angles, shots=shots)
-        print(f"    Step {step+1}/{n}: l_mid={l_mid} "
-              f"(x={x_vals[l_mid]:.3f}), P[X≤l_mid]≈{prob:.4f}")
-        if prob >= 1 - alpha:
+        objective = make_var_objective_kernel(n, l_mid)
+        prob = estimate_amplitude_qae(
+            n, m, amplitudes, objective, shots=shots
+        )
+
+        print(
+            f"    Step {step}: l_mid={l_mid} (x={x_vals[l_mid]:.3f}), "
+            f"P[X<=l_mid]~{prob:.4f}"
+        )
+
+        if prob >= tail_prob:
             l_high = l_mid
         else:
-            l_low = l_mid
+            l_low = l_mid + 1
 
-    var_alpha_index = l_high
+    var_alpha_index = l_low
     var_alpha_x = x_vals[var_alpha_index]
+
+    objective = make_var_objective_kernel(n, var_alpha_index)
     prob_var = estimate_amplitude_qae(
-        n, m, amplitudes,
-        make_objective_angles_comparator(n, var_alpha_index),
-        shots=shots,
+        n, m, amplitudes, objective, shots=shots
     )
-    print(f"  → VaR_{1-alpha:.0%} = index {var_alpha_index} "
-          f"(x = {var_alpha_x:.4f}), P[X≤VaR]≈{prob_var:.4f}")
+
+    print(
+        f"  -> VaR_{alpha:.0%} = index {var_alpha_index} "
+        f"(x={var_alpha_x:.4f}), P[X<=VaR]~{prob_var:.4f}"
+    )
     return var_alpha_index, var_alpha_x, prob_var
 
+
 # ===================================================
-# Step 6: CVaR の計算
+# Step 5: CVaR の計算
 # ===================================================
 
 def compute_cvar(
     alpha: float,
-    var_alpha_index: int, var_alpha_x: float, prob_var: float,
-    n: int, m: int,
+    var_alpha_index: int,
+    var_alpha_x: float,
+    prob_var: float,
+    n: int,
+    m: int,
     amplitudes: np.ndarray,
-    mu: float, sigma: float,
+    mu: float,
+    sigma: float,
     shots: int = 4096,
 ) -> float:
-    """
-    完全 QAE による CVaR_α の計算。
+    """Woerner--Egger の u=0 efficient F を用いて下側 CVaR を推定する。"""
+    del alpha, var_alpha_x  # 定義を明示するため引数として残す
 
-    VaR の結果を使って追加 1 回の QAE を実行し
-    CVaR = (E[f(X)]·(x_max-x_min) + x_min·P[X≤l_α]) / P[X≤l_α]
-    として復元する。
-    """
     N = 2 ** n
-    x_vals = np.linspace(mu - 3*sigma, mu + 3*sigma, N)
-    x_min, x_max = x_vals[0], x_vals[-1]
-    obj_angles = make_objective_angles_cvar(n, var_alpha_index, mu, sigma)
-    ef = estimate_amplitude_qae(n, m, amplitudes, obj_angles, shots=shots)
-    return (ef * (x_max - x_min) + x_min * prob_var) / prob_var \
-           if prob_var > 0 else 0.0
+    x_vals = np.linspace(mu - 3 * sigma, mu + 3 * sigma, N)
+    x_min = x_vals[0]
+    dx = x_vals[1] - x_vals[0]
+
+    if prob_var <= 0.0:
+        return float("nan")
+
+    # l_alpha = 0 の場合、選択領域の index は 0 のみ。
+    if var_alpha_index == 0:
+        return float(x_min)
+
+    c = choose_u0_scaling_c(m)
+    objective = make_cvar_objective_kernel(n, var_alpha_index, c)
+    amplitude = estimate_amplitude_qae(
+        n, m, amplitudes, objective, shots=shots
+    )
+
+    # u=0:
+    # amplitude ~= c * E[(i/l) 1[i<=l]] + (1-c)/2 * P[i<=l]
+    truncated_normalized_mean = (
+        amplitude - 0.5 * (1.0 - c) * prob_var
+    ) / c
+
+    conditional_mean_index = (
+        var_alpha_index * truncated_normalized_mean / prob_var
+    )
+    cvar_x = x_min + dx * conditional_mean_index
+
+    print(
+        f"  CVaR efficient F: c={c:.4f}, QAE amplitude~{amplitude:.4f}, "
+        f"E[index | tail]~{conditional_mean_index:.4f}"
+    )
+    return float(cvar_x)
+
 
 
 # %% [markdown]
-# ### 可視化とメイン実行
+# ### 可視化部分の実装
 #
 # 結果をわかりやすく見るために、読み込んだ分布と VaR・CVaR を描画するグラフのための関数を実装しましょう。
 
 # %%
 # ===================================================
-# Step 7: 可視化（m を変化させた場合の精度比較）
+# Step 6: 可視化（m を変化させた場合の精度比較）
 # ===================================================
 
 def plot_results_vs_m(
@@ -686,50 +964,49 @@ def plot_results_vs_m(
     mu: float,
     sigma: float,
 ):
-    """
-    m を変化させたときの VaR・CVaR 推定精度を可視化する。
-
-    上段：各 m の損失分布と VaR・CVaR の位置
-    下段左：m ごとの VaR 推定値と理論値の比較
-    下段右：m ごとの CVaR 推定値と古典真値・理論値の比較
-    """
     m_list = sorted(results_by_m.keys())
     N = 2 ** n
-    x_vals = np.linspace(mu - 3*sigma, mu + 3*sigma, N)
+    tail_prob = 1.0 - alpha
+
+    x_vals = np.linspace(mu - 3 * sigma, mu + 3 * sigma, N)
     probs = norm.pdf(x_vals, mu, sigma)
     probs /= probs.sum()
 
-    theory_var  = norm.ppf(1 - alpha, mu, sigma)
-    theory_cvar = mu - sigma * norm.pdf(norm.ppf(alpha)) / alpha
+    z = norm.ppf(tail_prob)
+    theory_var = norm.ppf(tail_prob, mu, sigma)
+    theory_cvar = mu - sigma * norm.pdf(z) / tail_prob
 
-    # 古典真値（離散）：VaR インデックスごとに計算
     def classical_cvar(var_idx):
         prob_var_true = sum(probs[i] for i in range(var_idx + 1))
         if prob_var_true == 0:
             return 0.0
-        return sum(x_vals[i] * probs[i] for i in range(var_idx + 1)) / prob_var_true
+        return (
+            sum(x_vals[i] * probs[i] for i in range(var_idx + 1))
+            / prob_var_true
+        )
 
     n_cols = len(m_list)
     fig = plt.figure(figsize=(4 * n_cols, 10))
     gs = plt.GridSpec(
-        2, n_cols,
-        hspace=0.5, wspace=0.35,
+        2,
+        n_cols,
+        hspace=0.5,
+        wspace=0.35,
         height_ratios=[2, 1],
     )
 
-    var_estimates  = []
+    var_estimates = []
     cvar_estimates = []
     cvar_classical = []
 
-    # ===== 上段：各 m の分布と VaR・CVaR =====
     for col, m in enumerate(m_list):
         ax = fig.add_subplot(gs[0, col])
         res = results_by_m[m]
 
-        var_idx  = res["var_alpha_index"]
-        var_x    = res["var_alpha_x"]
+        var_idx = res["var_alpha_index"]
+        var_x = res["var_alpha_x"]
         cvar_val = res["cvar_alpha"]
-        cvar_cl  = classical_cvar(var_idx)
+        cvar_cl = classical_cvar(var_idx)
 
         var_estimates.append(var_x)
         cvar_estimates.append(cvar_val)
@@ -737,24 +1014,45 @@ def plot_results_vs_m(
 
         bar_width = (x_vals[1] - x_vals[0]) * 0.85
         ax.bar(
-            x_vals[:var_idx + 1], probs[:var_idx + 1],
-            width=bar_width, color="#D85A30", alpha=0.6,
+            x_vals[: var_idx + 1],
+            probs[: var_idx + 1],
+            width=bar_width,
+            color="#D85A30",
+            alpha=0.6,
             label="CVaR region",
         )
         ax.bar(
-            x_vals[var_idx + 1:], probs[var_idx + 1:],
-            width=bar_width, color="#1f77b4", alpha=0.6,
+            x_vals[var_idx + 1 :],
+            probs[var_idx + 1 :],
+            width=bar_width,
+            color="#1f77b4",
+            alpha=0.6,
         )
-        ax.axvline(x=var_x, color="#D85A30", linestyle="--",
-                   linewidth=1.8, label=f"VaR = {var_x:.2f}")
-        ax.axvline(x=cvar_val, color="#7F77DD", linestyle=":",
-                   linewidth=1.8, label=f"CVaR = {cvar_val:.2f}")
-        ax.axvline(x=theory_var, color="gray", linestyle="-.",
-                   linewidth=1.0, alpha=0.7,
-                   label=f"Theoretical VaR = {theory_var:.2f}")
+        ax.axvline(
+            x=var_x,
+            color="#D85A30",
+            linestyle="--",
+            linewidth=1.8,
+            label=f"VaR = {var_x:.2f}",
+        )
+        ax.axvline(
+            x=cvar_val,
+            color="#7F77DD",
+            linestyle=":",
+            linewidth=1.8,
+            label=f"CVaR = {cvar_val:.2f}",
+        )
+        ax.axvline(
+            x=theory_var,
+            color="gray",
+            linestyle="-.",
+            linewidth=1.0,
+            alpha=0.7,
+            label=f"Theoretical VaR = {theory_var:.2f}",
+        )
 
         ax.set_title(f"$m={m}$ ($M={2**m}$)", fontsize=11)
-        ax.set_xlabel("Price $X$", fontsize=9)
+        ax.set_xlabel("Portfolio value $X$", fontsize=9)
         ax.set_ylabel("Probability", fontsize=9)
         ax.legend(fontsize=6, loc="upper left")
         ax.set_xlim(x_vals[0] - 0.2, x_vals[-1] + 0.2)
@@ -762,62 +1060,98 @@ def plot_results_vs_m(
     plt.suptitle(
         f"Quantum Risk Analysis — Woerner & Egger (2019)\n"
         f"Fully QAE: fixed $n={n}$ ($N={N}$), varied $m$ \n"
-        f"($\\alpha={alpha}$, $\\mu={mu}$, $\\sigma={sigma}$)",
-        fontsize=12, y=1.01,
+        f"(confidence $\\alpha={alpha}$, tail $1-\\alpha={tail_prob:.3f}$)",
+        fontsize=12,
+        y=1.01,
     )
     plt.show()
 
 
+
 # %% [markdown]
+# ## 結果
+#
 # ここまで実装したものを実行するメイン部分を書いて、完成です。
+# これを実行し、結果を見てみましょう。
 
 # %%
 # ===================================================
 # メイン実行
 # ===================================================
 
-alpha  = 0.05
-shots  = 4096
-mu     = 0.0
-sigma  = 1.0
-n      = 4        # 量子ビット数を固定
-m_list = [1, 3, 5]  # m を変化させる
+alpha = 0.95     # 信頼水準。下側 tail probability は 1-alpha = 0.05
+shots = 4096
+mu = 0.0
+sigma = 1.0
+n = 4
+m_list = [1, 3, 5]
 
-print("=" * 55)
-print(f"Quantum Risk Analysis — Fully QAE (based on QPE)")
-print(f"n={n} 固定 (N={2**n}), m を変化: {m_list}")
-print(f"α={alpha}, μ={mu}, σ={sigma}")
-print("=" * 55)
+tail_prob = 1.0 - alpha
 
-theory_var  = norm.ppf(1 - alpha, mu, sigma)
-theory_cvar = mu - sigma * norm.pdf(norm.ppf(alpha)) / alpha
-print(f"\n理論値: VaR={theory_var:.4f}, CVaR={theory_cvar:.4f}\n")
+print("=" * 60)
+print("Quantum Risk Analysis — Fully QAE (Woerner--Egger u=0 F)")
+print(f"n={n} fixed (N={2**n}), m={m_list}")
+print(
+    f"confidence alpha={alpha:.2f} ({alpha:.0%}), "
+    f"lower-tail probability={tail_prob:.2f} ({tail_prob:.0%})"
+)
+print(f"mu={mu}, sigma={sigma}")
+print("=" * 60)
+
+z = norm.ppf(tail_prob)
+theory_var = norm.ppf(tail_prob, mu, sigma)
+theory_cvar = mu - sigma * norm.pdf(z) / tail_prob
+print(
+    f"\nContinuous normal: VaR_{alpha:.0%}={theory_var:.4f}, "
+    f"CVaR_{alpha:.0%}={theory_cvar:.4f}\n"
+)
 
 amplitudes = make_normal_amplitudes(n, mu=mu, sigma=sigma)
 results_by_m = {}
 
 for m in m_list:
-    print(f"\n{'='*45}")
+    print(f"\n{'=' * 45}")
     print(f"m={m} (M={2**m})")
-    print(f"{'='*45}")
+    print(f"{'=' * 45}")
 
     var_idx, var_x, prob_var = compute_var(
-        alpha, n, m, amplitudes, mu=mu, sigma=sigma, shots=shots
-    )
-    cvar = compute_cvar(
-        alpha, var_idx, var_x, prob_var,
-        n, m, amplitudes, mu=mu, sigma=sigma, shots=shots
+        alpha,
+        n,
+        m,
+        amplitudes,
+        mu=mu,
+        sigma=sigma,
+        shots=shots,
     )
 
-    print(f"\n--- 結果 ---")
-    print(f"VaR_{1-alpha:.0%}  = {var_x:.4f}  （理論値 {theory_var:.4f}）")
-    print(f"CVaR_{1-alpha:.0%} = {cvar:.4f}  （理論値 {theory_cvar:.4f}）")
+    cvar = compute_cvar(
+        alpha,
+        var_idx,
+        var_x,
+        prob_var,
+        n,
+        m,
+        amplitudes,
+        mu=mu,
+        sigma=sigma,
+        shots=shots,
+    )
+
+    print("\n--- result ---")
+    print(
+        f"VaR_{alpha:.0%}  = {var_x:.4f}  "
+        f"(continuous normal {theory_var:.4f})"
+    )
+    print(
+        f"CVaR_{alpha:.0%} = {cvar:.4f}  "
+        f"(continuous normal {theory_cvar:.4f})"
+    )
 
     results_by_m[m] = {
         "var_alpha_index": var_idx,
-        "var_alpha_x":     var_x,
-        "prob_var":        prob_var,
-        "cvar_alpha":      cvar,
+        "var_alpha_x": var_x,
+        "prob_var": prob_var,
+        "cvar_alpha": cvar,
     }
 
 plot_results_vs_m(
@@ -828,13 +1162,18 @@ plot_results_vs_m(
     sigma=sigma,
 )
 
+
 # %% [markdown]
-# 入力として用いた正規分布と、計算された VaR と CVaR を縦線で表示しています。
-# オレンジ色の棒グラフは VaR 以下の領域、青色部分は VaR を超える領域を示しています。
-# $m$ は QAE のサブルーチンとして用いられている QPE のサンプリング量子ビット数であり、QPE が推定可能な振幅の候補の数 ($M = 2^m$ 個) を決めるものです。
-# $m$ を増やすことで、VaR と CVaR の計算精度が向上していることがわかります。
-# QAE の誤差は $\mathcal{O}(M^{-1})$ で収束しますが、この問題設定では $n$ の小ささによる離散化誤差も発生します。
-# より精度を高めたければ、$m, n$ の両方を増やすことが必要となります。
+# 入力として用いた離散正規分布、そして QAE により推定した VaR および CVaR を縦線で示しています。
+# オレンジ色の棒グラフは VaR 以下の下側テイル領域、青色部分は VaR を超える領域を表しています。
+# $m$ は QAE 内部の QPE で用いる位相推定レジスタの量子ビット数であり、$M=2^m$ によって位相、そして振幅推定の分解能が決まります。
+# この結果では、$m=1$ に比べて $m=3,5$ で VaR の推定値は大きく改善しています。
+# ただし有限な $m$ の QAE では推定可能な振幅が離散的であり、その値を用いて二分探索を行うため、$m$ の増加に対して VaR の誤差が必ず単調に減少するとは限りません。
+# 一方、CVaR は VaR 以下の領域に対する条件付き期待値であり、この実装では $u=0$ でのテイラー展開近似による $F$ を利用しています。  
+# そのため、CVaR の誤差には QAE の有限精度だけでなく、$F$ の近似誤差や VaR 推定誤差も含まれます。
+# 特にテイルの確率が小さい場合、条件付き期待値を復元する際に QAE の誤差が増幅されるため、今回の結果からは CVaR が $m$ とともに単調に改善していることは確認できません。
+# また、量子回路に入力している分布は $N=2^n$ 点に離散化された分布であるため、QAE の推定誤差とは別に $n$ に由来する離散化誤差も存在します。
+# したがって精度を高めるには、QAE の分解能を決める $m$ と、確率分布の離散化精度を決める $n$ の双方を考慮する必要があります。
 
 # %% [markdown]
 #
