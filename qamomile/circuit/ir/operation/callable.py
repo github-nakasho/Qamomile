@@ -5,8 +5,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 import uuid as uuid_module
-from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from collections.abc import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 from qamomile.circuit.ir.block import Block
 from qamomile.circuit.ir.value import (
@@ -16,10 +16,16 @@ from qamomile.circuit.ir.value import (
     Value,
     ValueBase,
     ValueLike,
+    collect_value_like_uuids,
     remap_value_metadata_references,
 )
 
+from .control_value import normalize_control_value
 from .operation import Operation, OperationKind, ParamHint, Signature
+from .return_operation import ReturnOperation
+
+if TYPE_CHECKING:
+    from qamomile.circuit.ir.effect import KernelEffect
 
 
 class CallTransform(enum.Enum):
@@ -28,6 +34,44 @@ class CallTransform(enum.Enum):
     DIRECT = "direct"
     INVERSE = "inverse"
     CONTROLLED = "controlled"
+    CONTROLLED_INVERSE = "controlled_inverse"
+
+    @property
+    def is_controlled(self) -> bool:
+        """Return whether the transform adds coherent controls.
+
+        Returns:
+            bool: Whether the invocation has a control prefix.
+        """
+        return self in {
+            CallTransform.CONTROLLED,
+            CallTransform.CONTROLLED_INVERSE,
+        }
+
+    @property
+    def is_inverse(self) -> bool:
+        """Return whether the transform requests inverse application.
+
+        Returns:
+            bool: Whether the callable is applied in reverse.
+        """
+        return self in {
+            CallTransform.INVERSE,
+            CallTransform.CONTROLLED_INVERSE,
+        }
+
+    def inverted(self) -> CallTransform:
+        """Toggle inverse application while preserving coherent control.
+
+        Returns:
+            CallTransform: Transform with the inverse component toggled.
+        """
+        return {
+            CallTransform.DIRECT: CallTransform.INVERSE,
+            CallTransform.INVERSE: CallTransform.DIRECT,
+            CallTransform.CONTROLLED: CallTransform.CONTROLLED_INVERSE,
+            CallTransform.CONTROLLED_INVERSE: CallTransform.CONTROLLED,
+        }[self]
 
 
 class CallPolicy(enum.Enum):
@@ -110,24 +154,245 @@ class CallableImplementation:
 
     Args:
         transform (CallTransform): Transform this implementation realizes.
-        backend (str | None): Backend name for native implementations.
+        engine (str | None): Engine name for native implementations.
         strategy (str | None): Strategy name such as ``"standard"``.
         body (Block | None): IR implementation body. A transform-specific body
             realizes that transform completely; a controlled body therefore
             includes control operands in its signature.
         body_ref (CallableBodyRef | None): Reference to a body that should be
             materialized by a later resolver. Defaults to ``None``.
-        emitter (Any): Backend-native emitter object.
+        emitter (Any): Engine-native emitter object.
         attrs (dict[str, Any]): Serializer-friendly implementation metadata.
     """
 
     transform: CallTransform = CallTransform.DIRECT
-    backend: str | None = None
+    engine: str | None = None
     strategy: str | None = None
     body: Block | None = None
     body_ref: CallableBodyRef | None = None
     emitter: Any = None
     attrs: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass(frozen=True)
+class CallableBodySelection:
+    """Describe one validated IR body selected for an invocation.
+
+    Args:
+        body (Block | None): Selected IR body, or ``None`` when no composable
+            body is available.
+        realized_transform (CallTransform): Transform already implemented by
+            ``body``.
+        operands (tuple[ValueBase, ...]): Call-site operands corresponding to
+            the selected body's formal inputs.
+        results (tuple[ValueBase, ...]): Call-site results corresponding to
+            the selected body's formal outputs.
+    """
+
+    body: Block | None
+    realized_transform: CallTransform
+    operands: tuple[ValueBase, ...]
+    results: tuple[ValueBase, ...]
+
+    @property
+    def implements_controls(self) -> bool:
+        """Return whether the selected body includes invocation controls.
+
+        Returns:
+            bool: True when ``realized_transform`` includes coherent control.
+        """
+        return self.realized_transform.is_controlled
+
+    def map_result_indices(
+        self,
+        body_indices: Iterable[int],
+        invocation_results: Sequence[ValueBase],
+    ) -> frozenset[int]:
+        """Map selected-body output positions to invocation result positions.
+
+        Generic controlled lowering removes the external control prefix before
+        aligning a direct body. Transform-specific implementations instead use
+        the complete invocation ABI. Mapping through the selected call-site
+        result values handles both layouts, including any quantum/non-quantum
+        reordering performed while aligning a fallback body.
+
+        Args:
+            body_indices (Iterable[int]): Selected-body output positions to
+                map.
+            invocation_results (Sequence[ValueBase]): Complete caller-side
+                invocation results.
+
+        Returns:
+            frozenset[int]: Corresponding positions in ``invocation_results``.
+        """
+        caller_indices = {
+            result.uuid: index for index, result in enumerate(invocation_results)
+        }
+        mapped: set[int] = set()
+        for body_index in body_indices:
+            if body_index < 0 or body_index >= len(self.results):
+                continue
+            caller_index = caller_indices.get(self.results[body_index].uuid)
+            if caller_index is not None:
+                mapped.add(caller_index)
+        return frozenset(mapped)
+
+
+def _validate_selected_body_contract(
+    body: Block,
+    operands: Sequence[ValueBase],
+    results: Sequence[ValueBase],
+    *,
+    callable_name: str,
+    realized_transform: CallTransform,
+) -> None:
+    """Validate a selected implementation body against one call site.
+
+    Args:
+        body (Block): Selected implementation body.
+        operands (Sequence[ValueBase]): Actual inputs aligned to ``body``.
+        results (Sequence[ValueBase]): Actual outputs aligned to ``body``.
+        callable_name (str): Callable name used in diagnostics.
+        realized_transform (CallTransform): Transform implemented by ``body``.
+
+    Raises:
+        ValueError: If input/output arity, scalar-versus-array layout, static
+            array rank/shape, or IR value types disagree.
+    """
+    _validate_selected_body_values(
+        body.input_values,
+        operands,
+        callable_name=callable_name,
+        realized_transform=realized_transform,
+        role="input",
+    )
+    _validate_selected_body_values(
+        body.output_values,
+        results,
+        callable_name=callable_name,
+        realized_transform=realized_transform,
+        role="output",
+    )
+
+
+def _validate_selected_body_values(
+    formals: Sequence[ValueBase],
+    actuals: Sequence[ValueBase],
+    *,
+    callable_name: str,
+    realized_transform: CallTransform,
+    role: str,
+) -> None:
+    """Validate one side of a selected implementation-body ABI.
+
+    Args:
+        formals (Sequence[ValueBase]): Body-side formal values.
+        actuals (Sequence[ValueBase]): Invocation-side actual values.
+        callable_name (str): Callable name used in diagnostics.
+        realized_transform (CallTransform): Transform implemented by the body.
+        role (str): Diagnostic role, either ``"input"`` or ``"output"``.
+
+    Raises:
+        ValueError: If arity, scalar-versus-array layout, static array shape,
+            or value types disagree.
+    """
+    prefix = (
+        f"Callable '{callable_name}' {realized_transform.value} implementation "
+        f"{role} contract"
+    )
+    if len(formals) != len(actuals):
+        raise ValueError(
+            f"{prefix} expects {len(formals)} value(s), but the invocation "
+            f"provides {len(actuals)}."
+        )
+    for index, (formal, actual) in enumerate(zip(formals, actuals, strict=True)):
+        formal_is_array = isinstance(formal, ArrayValue)
+        actual_is_array = isinstance(actual, ArrayValue)
+        if formal.type != actual.type or formal_is_array != actual_is_array:
+            raise ValueError(
+                f"{prefix} value {index} expects "
+                f"{_value_contract_description(formal)}, but the invocation "
+                f"provides {_value_contract_description(actual)}."
+            )
+        if not formal_is_array:
+            continue
+        assert isinstance(formal, ArrayValue)
+        assert isinstance(actual, ArrayValue)
+        if len(formal.shape) != len(actual.shape):
+            raise ValueError(
+                f"{prefix} value {index} expects array rank "
+                f"{len(formal.shape)}, but the invocation provides rank "
+                f"{len(actual.shape)}."
+            )
+        for dimension, (formal_size, actual_size) in enumerate(
+            zip(formal.shape, actual.shape, strict=True)
+        ):
+            formal_const = formal_size.get_const()
+            actual_const = actual_size.get_const()
+            if (
+                type(formal_const) is int
+                and type(actual_const) is int
+                and formal_const != actual_const
+            ):
+                raise ValueError(
+                    f"{prefix} value {index} dimension {dimension} expects "
+                    f"size {formal_const}, but the invocation provides "
+                    f"size {actual_const}."
+                )
+
+
+def _value_contract_description(value: ValueBase) -> str:
+    """Return a compact diagnostic description of one IR value contract.
+
+    Args:
+        value (ValueBase): IR value to describe.
+
+    Returns:
+        str: Scalar type or array rank plus element type.
+    """
+    if isinstance(value, ArrayValue):
+        return f"rank-{len(value.shape)} array of {value.type!r}"
+    return repr(value.type)
+
+
+def _align_grouped_call_values_to_body(
+    formals: Sequence[ValueBase],
+    actuals: Sequence[ValueBase],
+) -> tuple[ValueBase, ...]:
+    """Restore body declaration order from a grouped transformed-call ABI.
+
+    Controlled and inverse frontend wrappers store quantum operands before
+    classical/object operands, while a source callable body retains its Python
+    declaration order.  When generic lowering reuses that source body, align
+    the two stable per-kind subsequences before validating the body contract.
+    A category-count mismatch is left unchanged so the normal contract
+    validator reports the offending value instead of hiding malformed IR.
+
+    Args:
+        formals (Sequence[ValueBase]): Selected body inputs or outputs in
+            declaration order.
+        actuals (Sequence[ValueBase]): Call-site values after external control
+            operands have been removed.
+
+    Returns:
+        tuple[ValueBase, ...]: Actual values ordered to match ``formals`` when
+            quantum/non-quantum category counts agree; otherwise the original
+            order for fail-closed validation.
+    """
+    if len(formals) != len(actuals):
+        return tuple(actuals)
+    quantum_actuals = [actual for actual in actuals if actual.type.is_quantum()]
+    nonquantum_actuals = [actual for actual in actuals if not actual.type.is_quantum()]
+    formal_quantum_count = sum(formal.type.is_quantum() for formal in formals)
+    if formal_quantum_count != len(quantum_actuals):
+        return tuple(actuals)
+
+    quantum = iter(quantum_actuals)
+    nonquantum = iter(nonquantum_actuals)
+    return tuple(
+        next(quantum) if formal.type.is_quantum() else next(nonquantum)
+        for formal in formals
+    )
 
 
 @dataclasses.dataclass
@@ -163,15 +428,18 @@ class CallableDef:
         self,
         *,
         transform: CallTransform = CallTransform.DIRECT,
-        backend: str | None = None,
+        engine: str | None = None,
         strategy: str | None = None,
+        require_body: bool = False,
     ) -> CallableImplementation | None:
         """Return the best matching implementation candidate.
 
         Args:
             transform (CallTransform): Requested call transform.
-            backend (str | None): Requested backend name.
+            engine (str | None): Requested engine name.
             strategy (str | None): Requested strategy name.
+            require_body (bool): Whether candidates without an IR body should
+                be excluded before ranking. Defaults to False.
 
         Returns:
             CallableImplementation | None: Matching implementation, if any.
@@ -180,9 +448,10 @@ class CallableDef:
             impl
             for impl in self.implementations
             if impl.transform == transform
+            and (not require_body or impl.body is not None)
             and (
-                (backend is None and impl.backend is None)
-                or (backend is not None and impl.backend in (None, backend))
+                (engine is None and impl.engine is None)
+                or (engine is not None and impl.engine in (None, engine))
             )
             and (
                 (strategy is None and impl.strategy is None)
@@ -193,7 +462,7 @@ class CallableDef:
             return None
 
         def score(impl: CallableImplementation) -> int:
-            """Score exact backend and strategy matches above generic ones.
+            """Score exact engine and strategy matches above generic ones.
 
             Args:
                 impl (CallableImplementation): Candidate implementation.
@@ -201,9 +470,45 @@ class CallableDef:
             Returns:
                 int: Match score.
             """
-            return int(impl.backend == backend) + int(impl.strategy == strategy)
+            return int(impl.engine == engine) + int(impl.strategy == strategy)
 
         return max(candidates, key=score)
+
+    def effects_for(
+        self,
+        transform: CallTransform = CallTransform.DIRECT,
+    ) -> "KernelEffect":
+        """Return cached semantic effects for one call transform.
+
+        Args:
+            transform (CallTransform): Requested call transform. Defaults to
+                ``CallTransform.DIRECT``.
+
+        Returns:
+            KernelEffect: Union of relevant implementation-body effects.
+        """
+        from qamomile.circuit.ir.effect import callable_effects
+
+        return callable_effects(self, transform)
+
+    def measurement_result_indices_for(
+        self,
+        transform: CallTransform = CallTransform.DIRECT,
+    ) -> frozenset[int]:
+        """Return measured result positions for one call transform.
+
+        Args:
+            transform (CallTransform): Requested call transform. Defaults to
+                ``CallTransform.DIRECT``.
+
+        Returns:
+            frozenset[int]: Result indices carrying measurement provenance.
+        """
+        from qamomile.circuit.ir.effect import (
+            callable_measurement_result_indices,
+        )
+
+        return callable_measurement_result_indices(self, transform)
 
 
 def signature_from_values(
@@ -280,7 +585,10 @@ class _CallResultMaterializer:
     The materializer first reserves UUID and logical-ID mappings for the
     complete callee value graph, then rebuilds output values. Reserving first
     lets metadata on one output safely reference values owned by another
-    output or by an operation visited later in the block.
+    output or by an operation visited later in the block. Classical values
+    captured from an enclosing lexical scope are not callee-owned, so their
+    identity is preserved; this lets a later compile-time binding replace the
+    same value in both caller and callee graphs.
 
     Args:
         block (Block): Callee block whose outputs are being materialized.
@@ -311,6 +619,7 @@ class _CallResultMaterializer:
         self._reserved_uuids: set[str] = set()
         self._materialized: dict[str, ValueLike] = {}
         self._pass_through: dict[str, ValueLike] = {}
+        self._owned_uuids = self._collect_owned_uuids(block)
 
         for formal, actual in zip(block.input_values, actuals, strict=True):
             self._bind_input(formal, actual)
@@ -341,6 +650,8 @@ class _CallResultMaterializer:
             self._uuid_remap[value.uuid] = result.uuid
             self._logical_id_remap[value.logical_id] = result.logical_id
             return result
+        if value.uuid not in self._owned_uuids and value.type.is_classical():
+            return value
 
         self._reserve_value(value)
         new_uuid = self._uuid_remap[value.uuid]
@@ -379,30 +690,36 @@ class _CallResultMaterializer:
             result = dataclasses.replace(
                 value,
                 parent_array=(
-                    cast(ArrayValue, self.materialize(value.parent_array))
+                    cast(
+                        ArrayValue,
+                        self._materialize_dependency(value.parent_array),
+                    )
                     if value.parent_array is not None
                     else None
                 ),
                 element_indices=tuple(
-                    cast(Value, self.materialize(index))
+                    cast(Value, self._materialize_dependency(index))
                     for index in value.element_indices
                 ),
                 shape=tuple(
-                    cast(Value, self.materialize(dimension))
+                    cast(Value, self._materialize_dependency(dimension))
                     for dimension in value.shape
                 ),
                 slice_of=(
-                    cast(ArrayValue, self.materialize(value.slice_of))
+                    cast(
+                        ArrayValue,
+                        self._materialize_dependency(value.slice_of),
+                    )
                     if value.slice_of is not None
                     else None
                 ),
                 slice_start=(
-                    cast(Value, self.materialize(value.slice_start))
+                    cast(Value, self._materialize_dependency(value.slice_start))
                     if value.slice_start is not None
                     else None
                 ),
                 slice_step=(
-                    cast(Value, self.materialize(value.slice_step))
+                    cast(Value, self._materialize_dependency(value.slice_step))
                     if value.slice_step is not None
                     else None
                 ),
@@ -414,12 +731,15 @@ class _CallResultMaterializer:
             result = dataclasses.replace(
                 value,
                 parent_array=(
-                    cast(ArrayValue, self.materialize(value.parent_array))
+                    cast(
+                        ArrayValue,
+                        self._materialize_dependency(value.parent_array),
+                    )
                     if value.parent_array is not None
                     else None
                 ),
                 element_indices=tuple(
-                    cast(Value, self.materialize(index))
+                    cast(Value, self._materialize_dependency(index))
                     for index in value.element_indices
                 ),
                 metadata=metadata,
@@ -429,6 +749,25 @@ class _CallResultMaterializer:
 
         self._materialized[value.uuid] = result
         return result
+
+    def _materialize_dependency(self, value: ValueLike) -> ValueLike:
+        """Materialize a structural dependency without advancing an input.
+
+        Array shapes, slice bounds, parent arrays, and element indices describe
+        a result but are not themselves callable results. A dependency bound
+        to a caller value therefore keeps that exact SSA version.
+
+        Args:
+            value (ValueLike): Structural dependency to materialize.
+
+        Returns:
+            ValueLike: Bound caller value unchanged, or a caller-local clone
+            for a callee-owned dependency.
+        """
+        actual = self._bound_actual(value)
+        if actual is not None:
+            return actual
+        return self.materialize(value)
 
     def _bind_input(
         self,
@@ -506,6 +845,107 @@ class _CallResultMaterializer:
                 self._reserve_value(cast(ValueLike, value))
         self._reserve_operations(block.operations)
 
+    @classmethod
+    def _collect_owned_uuids(cls, block: Block) -> set[str]:
+        """Collect values defined by a callable rather than lexically captured.
+
+        Args:
+            block (Block): Callable body whose local producer identities should
+                be collected.
+
+        Returns:
+            set[str]: UUIDs owned by formals, parameters, static fields, and
+            operation results in this callable scope.
+        """
+        owned: set[str] = set()
+        for value in (*block.input_values, *block.parameters.values()):
+            owned.update(collect_value_like_uuids(value))
+        for slot in block.static_bindings:
+            owned.update(field.value.uuid for field in slot.fields)
+
+        def collect_results(operations: list[Operation]) -> None:
+            """Collect operation results without claiming their dependencies.
+
+            Args:
+                operations (list[Operation]): Operations in one lexical region.
+            """
+            for operation in operations:
+                for result in operation.results:
+                    cls._collect_result_uuids(result, owned)
+                nested_op_lists = getattr(operation, "nested_op_lists", None)
+                if callable(nested_op_lists):
+                    for nested in nested_op_lists():
+                        collect_results(nested)
+
+        collect_results(block.operations)
+        has_explicit_return = any(
+            isinstance(operation, ReturnOperation) for operation in block.operations
+        )
+        for output in block.output_values:
+            if has_explicit_return and cls._has_free_symbolic_classical_output(
+                output,
+                owned,
+            ):
+                raise ValueError(
+                    "A nested qkernel cannot return a symbolic classical "
+                    "value captured from its enclosing scope directly. Use "
+                    "the captured value inside the nested qkernel instead."
+                )
+            cls._collect_result_uuids(output, owned)
+        return owned
+
+    @classmethod
+    def _has_free_symbolic_classical_output(
+        cls,
+        value: ValueLike,
+        owned: set[str],
+    ) -> bool:
+        """Return whether an output directly exposes a free classical value.
+
+        Args:
+            value (ValueLike): Output value to inspect.
+            owned (set[str]): Identities already defined in the callee scope.
+
+        Returns:
+            bool: Whether a non-constant classical output lacks a local
+            producer.
+        """
+        if value.uuid in owned:
+            return False
+        if isinstance(value, TupleValue):
+            return any(
+                cls._has_free_symbolic_classical_output(element, owned)
+                for element in value.elements
+            )
+        if isinstance(value, DictValue):
+            return any(
+                cls._has_free_symbolic_classical_output(item, owned)
+                for key, entry_value in value.entries
+                for item in (key, entry_value)
+            )
+        return value.type.is_classical() and not value.is_constant()
+
+    @classmethod
+    def _collect_result_uuids(
+        cls,
+        value: ValueLike,
+        owned: set[str],
+    ) -> None:
+        """Collect identities produced as part of one operation result.
+
+        Args:
+            value (ValueLike): Operation result to inspect.
+            owned (set[str]): UUID set updated in place.
+        """
+        owned.add(value.uuid)
+        if isinstance(value, TupleValue):
+            for element in value.elements:
+                cls._collect_result_uuids(element, owned)
+        elif isinstance(value, DictValue):
+            for key, entry_value in value.entries:
+                cls._collect_result_uuids(key, owned)
+                cls._collect_result_uuids(entry_value, owned)
+
     def _reserve_operations(self, operations: list[Operation]) -> None:
         """Reserve values owned or referenced by an operation tree.
 
@@ -539,6 +979,10 @@ class _CallResultMaterializer:
             self._uuid_remap[value.uuid] = actual.uuid
             self._logical_id_remap[value.logical_id] = actual.logical_id
             return
+        if value.uuid not in self._owned_uuids and value.type.is_classical():
+            self._uuid_remap[value.uuid] = value.uuid
+            self._logical_id_remap[value.logical_id] = value.logical_id
+            return
 
         self._uuid_remap.setdefault(value.uuid, str(uuid_module.uuid4()))
         self._logical_id_remap.setdefault(
@@ -561,8 +1005,13 @@ class _CallResultMaterializer:
             self._uuid_remap[value.uuid] = result.uuid
             self._logical_id_remap[value.logical_id] = result.logical_id
             return
-        for child in self._value_children(value):
-            self._reserve_output_pass_throughs(child)
+        if isinstance(value, TupleValue):
+            for element in value.elements:
+                self._reserve_output_pass_throughs(element)
+        elif isinstance(value, DictValue):
+            for key, entry_value in value.entries:
+                self._reserve_output_pass_throughs(key)
+                self._reserve_output_pass_throughs(entry_value)
 
     @staticmethod
     def _value_children(value: ValueLike) -> tuple[ValueLike, ...]:
@@ -669,7 +1118,9 @@ class InvokeOperation(Operation):
         target (CallableRef): Callable identity.
         transform (CallTransform): Direct, inverse, or controlled invocation.
         attrs (dict[str, Any]): Compile-time attributes for strategy, arity,
-            and resource/lowering decisions. Values must be serializer-friendly.
+            and resource/lowering decisions. ``control_value`` is reserved for
+            a controlled invocation's LSB-first activation value. Values must
+            be serializer-friendly.
         definition (CallableDef | None): Optional callable definition.
     """
 
@@ -705,6 +1156,13 @@ class InvokeOperation(Operation):
                 attributes. Defaults to an empty dict.
             definition (CallableDef | None): Callable definition. Defaults to
                 ``None``, in which case one is created from ``target``.
+
+        Raises:
+            TypeError: If a controlled invocation's ``control_value`` or an
+                Oracle control-partition field has an invalid Python type.
+            ValueError: If ``control_value`` is used on a non-controlled call
+                or does not fit the controlled invocation's width, or if
+                Oracle invocation and definition control metadata disagree.
         """
         self.operands = cast(
             list[Value],
@@ -721,8 +1179,109 @@ class InvokeOperation(Operation):
         )
         self.transform = transform
         self.attrs = dict(attrs) if attrs is not None else {}
+        raw_control_value = self.attrs.pop("control_value", None)
+        if raw_control_value is not None:
+            if not self.transform.is_controlled:
+                raise ValueError(
+                    "control_value is only valid for a controlled invocation."
+                )
+            normalized_control_value = normalize_control_value(
+                raw_control_value,
+                self.num_control_qubits,
+            )
+            if normalized_control_value is not None:
+                self.attrs["control_value"] = normalized_control_value
         self.definition = definition
         self._ensure_definition()
+        self._validate_oracle_control_partition()
+        self._validate_oracle_definition_control_partition()
+
+    def _validate_oracle_control_partition(self) -> None:
+        """Validate declared and added Oracle control metadata.
+
+        Oracle invocations must describe a nonnegative partition whose sum
+        equals the operation's complete local control width.
+
+        Raises:
+            TypeError: If a partition field is not a plain Python integer.
+            ValueError: If the invocation kind disagrees with its definition,
+                a partition field is negative, or the partition does not sum
+                to ``num_control_qubits``.
+        """
+        if self.attrs.get("kind") != "oracle":
+            return
+        if (
+            self.definition is not None
+            and self.definition.attrs.get("kind") != "oracle"
+        ):
+            raise ValueError("Oracle invocation kind disagrees with its definition.")
+        partition_keys = (
+            "num_declared_control_qubits",
+            "num_added_control_qubits",
+        )
+        present = tuple(key in self.attrs for key in partition_keys)
+        if not all(present):
+            raise ValueError(
+                "Oracle control metadata must provide both "
+                "num_declared_control_qubits and num_added_control_qubits."
+            )
+        total = self.num_control_qubits
+        raw_declared = self.attrs["num_declared_control_qubits"]
+        raw_added = self.attrs["num_added_control_qubits"]
+        for key, value in zip(
+            partition_keys,
+            (raw_declared, raw_added),
+            strict=True,
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{key} must be a plain Python int, got {value!r}.")
+            if value < 0:
+                raise ValueError(f"{key} must be nonnegative, got {value}.")
+        if raw_declared + raw_added != total:
+            raise ValueError(
+                "Oracle control metadata is inconsistent: "
+                f"declared ({raw_declared}) + added ({raw_added}) "
+                f"!= total ({total})."
+            )
+
+    def _validate_oracle_definition_control_partition(self) -> None:
+        """Validate an Oracle's base definition against its invocation.
+
+        The definition records the base ABI and therefore contains only the
+        controls declared by the Oracle. The invocation may prepend additional
+        controls introduced by a later transform.
+
+        Raises:
+            ValueError: If definition metadata is incomplete or disagrees with
+                the invocation's declared-control and target widths.
+        """
+        if self.attrs.get("kind") != "oracle" or self.definition is None:
+            return
+        definition_attrs = self.definition.attrs
+        partition_keys = (
+            "num_declared_control_qubits",
+            "num_added_control_qubits",
+        )
+        if not all(key in definition_attrs for key in partition_keys):
+            raise ValueError(
+                "Oracle definition control metadata must provide both "
+                "num_declared_control_qubits and num_added_control_qubits."
+            )
+        declared = self.num_declared_control_qubits
+        expected = {
+            "num_control_qubits": declared,
+            "num_declared_control_qubits": declared,
+            "num_added_control_qubits": 0,
+            "num_target_qubits": self.num_target_qubits,
+        }
+        for key, value in expected.items():
+            if definition_attrs.get(key) != value:
+                raise ValueError(
+                    f"Oracle definition attribute {key!r} must be {value!r} "
+                    "for the invocation's base ABI."
+                )
+        if definition_attrs.get("kind") != "oracle":
+            raise ValueError("Oracle invocation kind disagrees with its definition.")
 
     def _ensure_definition(self) -> None:
         """Ensure the invocation has a compiler-facing callable definition."""
@@ -751,6 +1310,114 @@ class InvokeOperation(Operation):
         if self.definition is None:
             return None
         return self.definition.body
+
+    @property
+    def effects(self) -> "KernelEffect":
+        """Return cached effects of relevant callable implementations.
+
+        Returns:
+            KernelEffect: Effects reachable through this invocation.
+        """
+        from qamomile.circuit.ir.effect import callable_effects
+
+        return callable_effects(self.definition, self.transform)
+
+    @property
+    def measurement_result_indices(self) -> frozenset[int]:
+        """Return a conservative union of measurement-derived results.
+
+        An engine- or strategy-specific implementation may expose different
+        measurement provenance from the direct fallback body. This property
+        enumerates every distinct implementation-selection context recorded by
+        the callable and unions the exact caller-local result mappings. Use
+        :meth:`measurement_result_indices_for` when the engine and strategy
+        are known.
+
+        Returns:
+            frozenset[int]: Caller-local result indices derived from
+                measurement in any applicable implementation selection.
+        """
+        indices: set[int] = set()
+        for engine, strategy in self._measurement_selection_contexts():
+            indices.update(
+                self.measurement_result_indices_for(
+                    engine=engine,
+                    strategy=strategy,
+                )
+            )
+        return frozenset(indices)
+
+    def measurement_result_indices_for(
+        self,
+        *,
+        engine: str | None = None,
+        strategy: str | None = None,
+    ) -> frozenset[int]:
+        """Return measurement-derived results for one selected implementation.
+
+        Args:
+            engine (str | None): Engine name used for implementation
+                selection. Defaults to ``None``.
+            strategy (str | None): Strategy name used for implementation
+                selection. Defaults to the invocation's ``strategy_name``.
+
+        Returns:
+            frozenset[int]: Caller-local result positions derived from
+                measurement in the selected body.
+
+        Raises:
+            ValueError: If the selected body disagrees with the invocation's
+                input or output contract.
+        """
+        selection = self.select_body(engine=engine, strategy=strategy)
+        if selection.body is None:
+            return frozenset()
+        return selection.map_result_indices(
+            selection.body.measurement_result_indices,
+            self.results,
+        )
+
+    def _measurement_selection_contexts(
+        self,
+    ) -> tuple[tuple[str | None, str | None], ...]:
+        """Return selector pairs covering every possible body selection.
+
+        Implementation ranking can change only when a requested engine or
+        strategy equals metadata declared by an implementation. A synthetic
+        unmatched strategy also represents compiler overrides that select only
+        strategy-generic implementations or the direct fallback body.
+
+        Returns:
+            tuple[tuple[str | None, str | None], ...]: Engine and strategy
+                pairs whose union conservatively covers every selection.
+        """
+        implementations = (
+            self.definition.implementations if self.definition is not None else ()
+        )
+        engines: list[str | None] = [None]
+        engines.extend(
+            sorted(
+                {
+                    implementation.engine
+                    for implementation in implementations
+                    if implementation.engine is not None
+                }
+            )
+        )
+        declared_strategies = {
+            implementation.strategy
+            for implementation in implementations
+            if implementation.strategy is not None
+        }
+        strategies: list[str | None] = [None, *sorted(declared_strategies)]
+        if declared_strategies or self.strategy_name is not None:
+            unmatched = "__qamomile_unmatched_strategy__"
+            while unmatched in declared_strategies or unmatched == self.strategy_name:
+                unmatched += "_"
+            strategies.append(unmatched)
+        return tuple(
+            (engine, strategy) for engine in engines for strategy in strategies
+        )
 
     @body.setter
     def body(self, value: Block | None) -> None:
@@ -795,7 +1462,7 @@ class InvokeOperation(Operation):
         Returns:
             str: The callable name, optionally prefixed for transforms.
         """
-        if self.transform == CallTransform.INVERSE:
+        if self.transform.is_inverse:
             return f"{self.target.name}†"
         return self.target.name
 
@@ -807,6 +1474,51 @@ class InvokeOperation(Operation):
             int: Control arity recorded in ``attrs``. Defaults to ``0``.
         """
         return int(self.attrs.get("num_control_qubits", 0))
+
+    @property
+    def num_declared_control_qubits(self) -> int:
+        """Return controls included in an opaque Oracle's base definition.
+
+        Returns:
+            int: Definition-declared control arity.
+        """
+        return int(self.attrs.get("num_declared_control_qubits", 0))
+
+    @property
+    def num_added_control_qubits(self) -> int:
+        """Return controls introduced by a frontend control transform.
+
+        Returns:
+            int: Added control arity, or zero for direct calls.
+        """
+        return int(self.attrs.get("num_added_control_qubits", 0))
+
+    @property
+    def num_body_external_control_qubits(self) -> int:
+        """Return control operands generic lowering adds outside a base body.
+
+        An Oracle's declared controls are part of its definition-level ABI,
+        while controls added by a later transform sit outside that body.
+        Ordinary composite definitions declare no controls, so their complete
+        invocation control prefix is external.
+
+        Returns:
+            int: Number of leading invocation operands not passed to a direct
+            or inverse implementation body.
+        """
+        if self.attrs.get("kind") == "oracle":
+            return self.num_added_control_qubits
+        return self.num_control_qubits if self.transform.is_controlled else 0
+
+    @property
+    def control_value(self) -> int | None:
+        """Return the controlled invocation's activation value.
+
+        Returns:
+            int | None: LSB-first activation value, or ``None`` for the
+            ordinary all-ones control state.
+        """
+        return cast(int | None, self.attrs.get("control_value"))
 
     @property
     def num_target_qubits(self) -> int:
@@ -839,7 +1551,7 @@ class InvokeOperation(Operation):
             list[Value]: Quantum target operands after any controls, preserving
             their relative order even when classical parameters are interleaved
             in the callable signature. A vector target counts as one operand even when
-            ``num_target_qubits`` records its scalar backend width.
+            ``num_target_qubits`` records its scalar engine width.
         """
         start = self.num_control_qubits
         return [
@@ -910,17 +1622,20 @@ class InvokeOperation(Operation):
     def implementation_for(
         self,
         *,
-        backend: str | None = None,
+        engine: str | None = None,
         strategy: str | None = None,
+        require_body: bool = False,
     ) -> CallableImplementation | None:
         """Return the selected implementation for this invocation.
 
         Args:
-            backend (str | None): Backend name to match. Defaults to ``None``,
-                which only selects backend-generic implementations.
+            engine (str | None): Engine name to match. Defaults to ``None``,
+                which only selects engine-generic implementations.
             strategy (str | None): Strategy name to match. Defaults to
                 ``None``, meaning the invocation's ``strategy_name`` attribute
                 is used.
+            require_body (bool): Whether candidates without an IR body should
+                be excluded before ranking. Defaults to False.
 
         Returns:
             CallableImplementation | None: Matching implementation candidate,
@@ -931,20 +1646,21 @@ class InvokeOperation(Operation):
         requested_strategy = self.strategy_name if strategy is None else strategy
         return self.definition.implementation_for(
             transform=self.transform,
-            backend=backend,
+            engine=engine,
             strategy=requested_strategy,
+            require_body=require_body,
         )
 
     def effective_body(
         self,
         *,
-        backend: str | None = None,
+        engine: str | None = None,
         strategy: str | None = None,
     ) -> Block | None:
         """Return the implementation body selected for this invocation.
 
         Args:
-            backend (str | None): Backend name to match. Defaults to ``None``.
+            engine (str | None): Engine name to match. Defaults to ``None``.
             strategy (str | None): Strategy name to match. Defaults to the
                 invocation's ``strategy_name`` attribute.
 
@@ -954,10 +1670,129 @@ class InvokeOperation(Operation):
             A compiler may synthesize inverse or controlled behavior from this
             fallback body.
         """
-        impl = self.implementation_for(backend=backend, strategy=strategy)
+        impl = self.implementation_for(
+            engine=engine,
+            strategy=strategy,
+            require_body=True,
+        )
         if impl is not None and impl.body is not None:
             return impl.body
         return self.body
+
+    def body_for_transform(
+        self,
+        *,
+        engine: str | None = None,
+        strategy: str | None = None,
+    ) -> tuple[Block | None, CallTransform]:
+        """Select a body and report the transform it already realizes.
+
+        A controlled-inverse invocation may reuse an explicitly registered
+        inverse body when no implementation realizes both transforms. Keeping
+        that fallback in the IR operation gives emitters and static analyses
+        one selection rule while still letting each consumer apply the
+        remaining coherent controls in its own representation.
+
+        Args:
+            engine (str | None): Engine name to match. Defaults to ``None``.
+            strategy (str | None): Strategy name to match. Defaults to the
+                invocation's ``strategy_name`` attribute.
+
+        Returns:
+            tuple[Block | None, CallTransform]: Selected body and the transform
+            already implemented by that body. The callable's direct body is
+            returned with ``DIRECT`` when no transform-specific body matches.
+
+        Raises:
+            ValueError: If the selected body disagrees with the invocation's
+                input or output contract.
+        """
+        selection = self.select_body(engine=engine, strategy=strategy)
+        return selection.body, selection.realized_transform
+
+    def select_body(
+        self,
+        *,
+        engine: str | None = None,
+        strategy: str | None = None,
+    ) -> CallableBodySelection:
+        """Select and validate the composable body for this invocation.
+
+        The result carries the transform already realized by the body and the
+        exact call-site values that bind to it. Consumers therefore cannot
+        independently disagree about whether an invocation's control prefix
+        belongs to the selected implementation ABI.
+
+        Args:
+            engine (str | None): Engine name to match. Defaults to ``None``.
+            strategy (str | None): Strategy name to match. Defaults to the
+                invocation's ``strategy_name`` attribute.
+
+        Returns:
+            CallableBodySelection: Validated body, realized transform, and
+            aligned call-site operands and results.
+
+        Raises:
+            ValueError: If the selected body disagrees with the invocation's
+                input or output contract.
+        """
+        implementation = self.implementation_for(
+            engine=engine,
+            strategy=strategy,
+            require_body=True,
+        )
+        if implementation is not None and implementation.body is not None:
+            body = implementation.body
+            realized_transform = self.transform
+        elif (
+            self.transform is CallTransform.CONTROLLED_INVERSE
+            and self.definition is not None
+        ):
+            requested_strategy = self.strategy_name if strategy is None else strategy
+            inverse_implementation = self.definition.implementation_for(
+                transform=CallTransform.INVERSE,
+                engine=engine,
+                strategy=requested_strategy,
+                require_body=True,
+            )
+            if inverse_implementation is not None:
+                body = inverse_implementation.body
+                realized_transform = CallTransform.INVERSE
+            else:
+                body = self.body
+                realized_transform = CallTransform.DIRECT
+        else:
+            body = self.body
+            realized_transform = CallTransform.DIRECT
+
+        operands: tuple[ValueBase, ...] = tuple(self.operands)
+        results: tuple[ValueBase, ...] = tuple(self.results)
+        if self.transform.is_controlled and not realized_transform.is_controlled:
+            offset = self.num_body_external_control_qubits
+            operands = operands[offset:]
+            results = results[offset:]
+        if body is not None:
+            operands = _align_grouped_call_values_to_body(
+                body.input_values,
+                operands,
+            )
+            results = _align_grouped_call_values_to_body(
+                body.output_values,
+                results,
+            )
+            _validate_selected_body_contract(
+                body,
+                operands,
+                results,
+                callable_name=self.target.name,
+                realized_transform=realized_transform,
+            )
+        return CallableBodySelection(
+            body=body,
+            realized_transform=realized_transform,
+            operands=operands,
+            results=results,
+        )
 
     @property
     def signature(self) -> Signature:

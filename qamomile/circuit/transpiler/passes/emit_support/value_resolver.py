@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import numbers
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from qamomile.circuit.ir.value import Value, resolve_root_qubit_address
+from qamomile.circuit.ir.value import ArrayValue, Value, resolve_root_qubit_address
 from qamomile.circuit.transpiler.block_parameter_binding import (
     block_parameter_binding_keys,
     pair_block_parameter_operands,
@@ -16,9 +18,6 @@ from qamomile.circuit.transpiler.passes.emit_support.qubit_address import (
     QubitAddress,
     QubitMap,
 )
-
-if TYPE_CHECKING:
-    from qamomile.circuit.ir.value import ArrayValue
 
 
 @dataclass
@@ -67,7 +66,7 @@ class ValueResolver:
         """Create an emit-time resolver.
 
         Args:
-            parameters (set[str] | None): Names preserved as backend runtime
+            parameters (set[str] | None): Names preserved as engine runtime
                 parameters. Defaults to None.
         """
         self.parameters = parameters or set()
@@ -508,17 +507,23 @@ class ValueResolver:
         block_value: Any,
         param_operands: list["Value"],
         bindings: dict[str, Any],
+        *,
+        parameter_factory: Callable[[str, str], Any] | None = None,
     ) -> dict[str, Any]:
         """Create local bindings by matching block inputs to call-site operands.
 
         Args:
             block_value (Any): Nested block whose classical/object inputs are
                 bound. Objects without ``input_values`` receive no additional
-                local bindings for compatibility with optional backend recipes.
+                local bindings for compatibility with optional engine recipes.
             param_operands (list[Value]): Classical/object call-site operands
                 in the controlled operation's signature order.
             bindings (dict[str, Any]): Parent emit-time bindings used to
                 resolve the call-site operands.
+            parameter_factory (Callable[[str, str], Any] | None): Optional
+                engine parameter factory used when an operand is a declared
+                runtime parameter rather than a concrete binding. Defaults to
+                None so standalone resolver use remains engine-neutral.
 
         Returns:
             dict[str, Any]: Parent bindings with each inner formal rebound under
@@ -537,6 +542,24 @@ class ValueResolver:
         ):
             inner_keys = block_parameter_binding_keys(param_input)
             resolved = self.resolve_operand_for_binding(operand, bindings)
+            if (
+                resolved is None
+                and isinstance(param_input, ArrayValue)
+                and isinstance(operand, ArrayValue)
+            ):
+                # Runtime arrays are structural aliases, not scalar engine
+                # parameters. Preserve the actual array identity so element
+                # lookups in the callee can recover keys such as
+                # ``actual_name[2]`` even when the formal has another name.
+                resolved = operand
+            if (
+                resolved is None
+                and parameter_factory is not None
+                and isinstance(operand, Value)
+            ):
+                param_key = self.get_parameter_key(operand, bindings)
+                if param_key is not None:
+                    resolved = parameter_factory(param_key, operand.uuid)
             if resolved is not None:
                 for key in inner_keys:
                     local_bindings[key] = resolved
@@ -767,26 +790,36 @@ class ValueResolver:
 
         root_index = resolved_indices[0]
         cur = parent
-        # Compose each VectorView affine map back to the root container:
-        # root_index = slice_start + slice_step * local_index.
-        while cur.slice_of is not None:
-            # A sliced view must carry both affine-map operands. If either is
-            # absent, keep this access unresolved instead of inventing bounds.
-            if cur.slice_start is None or cur.slice_step is None:
+        visited_aliases: set[str] = set()
+        while True:
+            # Compose each VectorView affine map back to the root container:
+            # root_index = slice_start + slice_step * local_index.
+            while cur.slice_of is not None:
+                # A sliced view must carry both affine-map operands. If either is
+                # absent, keep this access unresolved instead of inventing bounds.
+                if cur.slice_start is None or cur.slice_step is None:
+                    return None
+                start = self.resolve_int_value(cur.slice_start, bindings)
+                step = self.resolve_int_value(cur.slice_step, bindings)
+                if start is None or step is None:
+                    # Symbolic slice bounds stay unresolved at emit time.
+                    return None
+                if start < 0 or step <= 0:
+                    # Bounds resolved from bindings must satisfy the same
+                    # contract the frontend enforces for constant bounds
+                    # (non-negative start, positive step); anything else
+                    # would compose a wrong root index.
+                    return None
+                root_index = start + step * root_index
+                cur = cur.slice_of
+
+            alias = bindings.get(cur.uuid)
+            if not isinstance(alias, ArrayValue) or alias.uuid == cur.uuid:
+                break
+            if cur.uuid in visited_aliases:
                 return None
-            start = self.resolve_int_value(cur.slice_start, bindings)
-            step = self.resolve_int_value(cur.slice_step, bindings)
-            if start is None or step is None:
-                # Symbolic slice bounds stay unresolved at emit time.
-                return None
-            if start < 0 or step <= 0:
-                # Bounds resolved from bindings must satisfy the same
-                # contract the frontend enforces for constant bounds
-                # (non-negative start, positive step); anything else
-                # would compose a wrong root index.
-                return None
-            root_index = start + step * root_index
-            cur = cur.slice_of
+            visited_aliases.add(cur.uuid)
+            cur = alias
 
         return cur, (root_index, *resolved_indices[1:])
 
@@ -856,7 +889,7 @@ class ValueResolver:
         value: "Value",
         bindings: dict[str, Any],
     ) -> str | None:
-        """Get the backend parameter key for a symbolic scalar.
+        """Get the engine parameter key for a symbolic scalar.
 
         Args:
             value (Value): Scalar value or array element to identify.
@@ -890,9 +923,21 @@ class ValueResolver:
         return None
 
     def _resolve_numeric_index(self, value: Any) -> int | None:
-        """Resolve a bound numeric scalar to a Python int."""
+        """Resolve an exactly integral bound scalar to a Python int.
+
+        Args:
+            value (Any): Candidate Python or NumPy numeric scalar.
+
+        Returns:
+            int | None: Exact integer value, or ``None`` for a non-integral,
+            non-finite, or non-numeric value.
+        """
         numeric = self._resolve_numeric_value(value)
         if numeric is None:
+            return None
+        if isinstance(numeric, int):
+            return numeric
+        if not math.isfinite(numeric) or not numeric.is_integer():
             return None
         return int(numeric)
 

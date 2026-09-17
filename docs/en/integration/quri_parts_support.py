@@ -25,7 +25,7 @@
 
 # %%
 # Install the latest Qamomile with the QURI Parts extras through pip.
-# # !pip install "qamomile[quri_parts]"
+# # !pip install "qamomile[quri_parts,visualization]"
 
 # %%
 # Collect every library used in this tutorial in one place.
@@ -100,10 +100,9 @@ plt.show()
 #
 # :::{tip}
 # Qamomile's rotation gates follow the $e^{-i\theta/2}$ convention.
-# Because of that, the $1/2$ factor is handled slightly differently in the cost and mixer layers.
-# In the mixer layer, we pass $2\beta$ to `rx`, so the $1/2$ cancels and we get the textbook $e^{-i\beta X}$.
-# In the cost layer, we pass $J_{ij} \cdot \gamma$ to `rzz`, so the $1/2$ remains.
-# We absorb this coefficient difference into the variational parameter $\gamma$: the $\gamma$ used here is twice the textbook QAOA $\gamma$.
+# We pass $2\beta$ to `rx`, $2J_{ij}\gamma$ to `rzz`, and $2h_i\gamma$ to `rz`.
+# The $1/2$ then cancels in every case, giving the textbook
+# $e^{-i\beta X}$ mixer and $e^{-i\gamma H_C}$ cost unitary exactly.
 # :::
 
 
@@ -127,9 +126,9 @@ def cost_layer(
 ) -> qmc.Vector[qmc.Qubit]:
     # Encode quadratic and linear Ising terms as phase rotations.
     for (i, j), Jij in quad.items():
-        q[i], q[j] = qmc.rzz(q[i], q[j], angle=Jij * gamma)
+        q[i], q[j] = qmc.rzz(q[i], q[j], angle=2.0 * Jij * gamma)
     for i, hi in linear.items():
-        q[i] = qmc.rz(q[i], angle=hi * gamma)
+        q[i] = qmc.rz(q[i], angle=2.0 * hi * gamma)
     return q
 
 
@@ -169,7 +168,8 @@ def qaoa_ansatz(
 
 # %%
 # Draw the Qamomile-level QAOA ansatz for the fixed problem shape.
-p = 3  # number of QAOA layers
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+p = 1 if docs_test_mode else 3  # number of QAOA layers
 qaoa_ansatz.draw(
     p=p,
     quad=spin_model.quad,
@@ -241,9 +241,8 @@ rng = np.random.default_rng(42)
 init_params = rng.uniform(-np.pi / 2, np.pi / 2, 2 * p)
 init_gammas = list(init_params[:p])
 init_betas = list(init_params[p:])
-docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-sample_shots = 256 if docs_test_mode else 2000
-maxiter = 20 if docs_test_mode else 100
+sample_shots = 1 if docs_test_mode else 2000
+maxiter = 4 if docs_test_mode else 100
 
 # Sample the parameterized executable and decode bitstrings to Ising energies.
 sample_result = executable.sample(
@@ -466,6 +465,7 @@ assert np.isclose(energy_via_estimate, energy_unbound, atol=1e-10)
 # To swap QURI Parts' sampler or estimator, pass it through `QuriPartsTranspiler.executor(sampler=..., estimator=...)`, or instantiate `QuriPartsExecutor(sampler=..., estimator=...)` directly.
 # The custom executor can be used anywhere `executor` appeared above.
 # Swapping the sampler does not require re-transpiling the kernel.
+# Custom samplers must return nonnegative whole measurement counts; fractional weights, including fractional outputs from ideal samplers, raise `ValueError`.
 # The executable carries the circuit, while the executor carries the sampler or estimator used for execution.
 #
 # As a concrete example, we build a noisy sampler with QURI Parts' Qulacs `NoiseSimulator`.

@@ -2,8 +2,8 @@
 
 import dataclasses
 
-from qamomile.circuit.ir.types.primitives import BitType, FloatType
-from qamomile.circuit.ir.value import ArrayValue, Value
+from qamomile.circuit.ir.types.primitives import BitType, FloatType, UIntType
+from qamomile.circuit.ir.value import ArrayValue, Value, array_static_length
 
 from .operation import Operation, OperationKind, ParamHint, Signature
 
@@ -15,15 +15,15 @@ class DecodeQFixedOperation(Operation):
     This operation converts a sequence of classical bits from qubit measurements
     into a floating-point number using fixed-point encoding.
 
-    The decoding formula:
-        float_value = Σ bit[i] * 2^(int_bits - 1 - i)
+    The decoding formula for least-significant-first storage:
+        float_value = Σ bit[i] * 2^(int_bits - num_bits + i)
 
     For QPE phase (int_bits=0):
-        float_value = 0.b0b1b2... = b0*0.5 + b1*0.25 + b2*0.125 + ...
+        bit[0] has weight ``2**(-num_bits)`` and bit[-1] has weight 0.5.
 
     Example:
         bits = [1, 0, 1] with int_bits=0
-        → 0.101 (binary) = 0.5 + 0.125 = 0.625
+        → 0.101 (MSB-first display) = 0.5 + 0.125 = 0.625
 
     Attributes:
         num_bits: Total number of bits to decode.
@@ -50,6 +50,56 @@ class DecodeQFixedOperation(Operation):
 
 
 @dataclasses.dataclass
+class DecodeQIntOperation(Operation):
+    """Decode least-significant-first measurement bits to an unsigned integer.
+
+    Carrier position ``i`` contributes ``bit[i] * 2**i``, which matches the
+    carrier ordering used by ``DecodeQFixedOperation``.
+
+    The bit count is not stored on the operation: it is derived from the
+    bit-array operand's static length through ``num_bits``.
+
+    Args:
+        operands (list[Value]): Single measured ``ArrayValue[Bit]`` operand.
+        results (list[Value]): Single decoded ``UIntType`` result.
+    """
+
+    @property
+    def num_bits(self) -> int | None:
+        """Return the bit count derived from the bit-array operand.
+
+        Returns:
+            int | None: Static bit-array length, including zero for an empty
+                array; ``None`` when the length is symbolic or the operand
+                is missing or not an array.
+        """
+        if not self.operands or not isinstance(self.operands[0], ArrayValue):
+            return None
+        return array_static_length(self.operands[0])
+
+    @property
+    def signature(self) -> Signature:
+        """Return the integer-decoder signature.
+
+        Returns:
+            Signature: One bit-array operand and one unsigned-integer result.
+        """
+        return Signature(
+            operands=[ParamHint(name="bits", type=BitType())],
+            results=[ParamHint(name="uint_out", type=UIntType())],
+        )
+
+    @property
+    def operation_kind(self) -> OperationKind:
+        """Classify integer decoding as host-side classical work.
+
+        Returns:
+            OperationKind: ``OperationKind.CLASSICAL``.
+        """
+        return OperationKind.CLASSICAL
+
+
+@dataclasses.dataclass
 class StoreArrayElementOperation(Operation):
     """Store a classical scalar into one element of a classical array.
 
@@ -71,7 +121,7 @@ class StoreArrayElementOperation(Operation):
     - **Runtime**: otherwise the store executes host-side in a classical
       segment via ``ClassicalExecutor`` (e.g. for measurement-derived
       ``Vector[Bit]`` contents).  It must never reach a quantum segment;
-      backend emit rejects it explicitly.
+      engine emit rejects it explicitly.
 
     Operand convention:
         operands: ``[array (ArrayValue), stored_value (Value), *index_values]``
@@ -119,6 +169,11 @@ class StoreArrayElementOperation(Operation):
 
     @property
     def signature(self) -> Signature:
+        """Return the operation's dynamic array/qubit/index signature.
+
+        Returns:
+            Signature: Operand-only signature with no SSA results.
+        """
         return Signature(
             operands=[
                 ParamHint(name="array", type=self.operands[0].type),
@@ -134,6 +189,105 @@ class StoreArrayElementOperation(Operation):
     @property
     def operation_kind(self) -> OperationKind:
         return OperationKind.CLASSICAL
+
+
+@dataclasses.dataclass
+class ReturnQuantumArrayElementOperation(Operation):
+    """Validate a branch-selected quantum element's array return at emit time.
+
+    Most quantum element assignments are verified structurally by the
+    frontend and emit no IR. A compile-time conditional can instead select
+    different element indices on its branches; only the unrolled emit context
+    knows which source index survived. This operation carries both the
+    requested target indices and the conditional source indices so emission
+    can prove they resolve to the same physical slot before treating the
+    assignment as a borrow return.
+
+    Operand convention:
+        ``[array, returned_qubit, *target_indices, *source_indices]``. The
+        target and source halves have equal nonzero arity, inferred from the
+        operand count. The operation has no results and emits no engine gate.
+    """
+
+    @property
+    def index_arity(self) -> int:
+        """Return the number of target (and source) index operands.
+
+        Returns:
+            int: Half of the operands following the array and qubit.
+        """
+        return (len(self.operands) - 2) // 2
+
+    @property
+    def array(self) -> ArrayValue:
+        """Return the quantum array receiving the borrowed element.
+
+        Returns:
+            ArrayValue: Root array operand.
+        """
+        return self.operands[0]  # type: ignore[return-value]
+
+    @property
+    def returned_value(self) -> Value:
+        """Return the quantum value being returned.
+
+        Returns:
+            Value: Returned qubit operand.
+        """
+        return self.operands[1]
+
+    @property
+    def target_indices(self) -> tuple[Value, ...]:
+        """Return the user-written assignment indices.
+
+        Returns:
+            tuple[Value, ...]: Target index operands.
+        """
+        arity = self.index_arity
+        return tuple(self.operands[2 : 2 + arity])
+
+    @property
+    def source_indices(self) -> tuple[Value, ...]:
+        """Return the branch-merged borrow-source indices.
+
+        Returns:
+            tuple[Value, ...]: Conditional source index operands.
+        """
+        arity = self.index_arity
+        return tuple(self.operands[2 + arity :])
+
+    @property
+    def signature(self) -> Signature:
+        """Return the deferred validator's operand-only signature.
+
+        Returns:
+            Signature: Dynamic array, qubit, and index operands with no SSA
+                results.
+        """
+        return Signature(
+            operands=[
+                ParamHint(name="array", type=self.array.type),
+                ParamHint(name="returned_value", type=self.returned_value.type),
+                *[
+                    ParamHint(name=f"target_index_{index}", type=value.type)
+                    for index, value in enumerate(self.target_indices)
+                ],
+                *[
+                    ParamHint(name=f"source_index_{index}", type=value.type)
+                    for index, value in enumerate(self.source_indices)
+                ],
+            ],
+            results=[],
+        )
+
+    @property
+    def operation_kind(self) -> OperationKind:
+        """Classify the return validator as a quantum operation.
+
+        Returns:
+            OperationKind: ``OperationKind.QUANTUM``.
+        """
+        return OperationKind.QUANTUM
 
 
 @dataclasses.dataclass

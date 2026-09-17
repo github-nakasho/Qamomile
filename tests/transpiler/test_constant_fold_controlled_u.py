@@ -65,6 +65,8 @@ class TestConstantFoldControlledUFields:
         block = transpiler.to_block(kernel, bindings={"n": 4})
         inlined = transpiler.inline(transpiler.substitute(block))
         validated = transpiler.affine_validate(inlined)
+        source = self._find_controlled_u(validated.operations)
+        assert isinstance(source, SymbolicControlledU)
         folded = transpiler.constant_fold(validated, bindings={"n": 4})
 
         cu = self._find_controlled_u(folded.operations)
@@ -73,6 +75,11 @@ class TestConstantFoldControlledUFields:
             f"Expected promotion to ConcreteControlledU, got {type(cu).__name__}"
         )
         assert cu.num_controls == 3
+        assert source.callable_ref is not None
+        assert source.callable_attrs
+        assert cu.callable_ref == source.callable_ref
+        assert cu.callable_attrs == source.callable_attrs
+        assert cu.callable_attrs is not source.callable_attrs
 
     def test_concrete_num_controls_unchanged(self):
         """A natively concrete ``num_controls`` stays unchanged through folding."""
@@ -278,8 +285,8 @@ class TestConstantFoldControlledUFields:
             _pool_out, _tgt_out = cg(pool, tgt, control_indices=[0, 1, n - 1])
             return qm.measure(_pool_out)
 
-        from qamomile.circuit.ir.serialize import dump_json
         from qamomile.circuit.ir.value import Value
+        from qamomile.circuit.serialization import serialize
         from qamomile.qiskit import QiskitTranspiler
 
         transpiler = QiskitTranspiler()
@@ -292,17 +299,16 @@ class TestConstantFoldControlledUFields:
         cu = self._find_controlled_u(folded.operations)
         assert cu is not None
         assert isinstance(cu, SymbolicControlledU)
-        # The bug Copilot flagged: num_controls used to become a
-        # bare ``int`` here, crashing every downstream consumer.
+        # num_controls must not become a bare ``int`` here because that
+        # would crash every downstream consumer.
         assert isinstance(cu.num_controls, Value), (
             f"SymbolicControlledU.num_controls must stay a Value; "
             f"got {type(cu.num_controls).__name__}"
         )
         assert cu.num_controls.get_const() == 3
-        # End-to-end smoke: the folded block must serialize cleanly
-        # (the original failure was an AttributeError from the
-        # encoder calling ``ctx.register_value(op.num_controls)``).
-        payload = dump_json(folded)
+        # End-to-end smoke: the static qkernel containing this symbolic
+        # controlled operation must serialize cleanly.
+        payload = serialize(kernel)
         assert len(payload) > 0
 
 

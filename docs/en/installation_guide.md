@@ -6,7 +6,12 @@ Qamomile can be installed via standard package managers, such as pip.
 pip install qamomile
 ```
 
-Qiskit is included as the default quantum SDK integration.
+Install optional integrations explicitly. For the Qiskit engine and circuit
+drawings used throughout the tutorials:
+
+```bash
+pip install "qamomile[qiskit,visualization]"
+```
 
 ```python
 from qamomile.qiskit import QiskitTranspiler, QiskitExecutor
@@ -14,7 +19,7 @@ from qamomile.qiskit import QiskitTranspiler, QiskitExecutor
 
 ## Supported quantum SDKs
 
-Qamomile supports multiple quantum SDK integrations. To use an additional quantum SDK, install its optional dependencies.
+Qamomile supports multiple quantum SDK integrations. Install the optional dependencies for each SDK you use.
 
 ::::{tab-set}
 
@@ -43,6 +48,19 @@ pip install "qamomile[quri_parts]"
 
 ```python
 from qamomile.quri_parts import QuriPartsTranspiler, QuriPartsExecutor
+```
+
+:::
+
+:::{tab-item} Amazon Braket
+:sync: braket
+
+```bash
+pip install "qamomile[braket]"
+```
+
+```python
+from qamomile.braket import BraketExecutor, BraketTranspiler
 ```
 
 :::

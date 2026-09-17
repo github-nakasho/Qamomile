@@ -1,6 +1,6 @@
 """Base test class for transpiler testing.
 
-This module provides TranspilerTestSuite, a base test class that backends
+This module provides TranspilerTestSuite, a base test class that engines
 inherit from to get comprehensive gate testing with minimal configuration.
 """
 
@@ -25,17 +25,17 @@ from .gate_test_specs import (
 class TranspilerTestSuite(ABC):
     """Base test suite for transpiler testing.
 
-    Inherit from this class to get comprehensive gate tests for your backend.
+    Inherit from this class to get comprehensive gate tests for your engine.
     Override the abstract methods and set the class attributes.
 
     Class Attributes:
-        backend_name: Name of the backend (e.g., "qiskit")
-        unsupported_gates: Set of gate names that this backend doesn't support
-        requires_classical_bits: Set to True if backend requires classical bits
+        engine_name: Name of the engine (e.g., "qiskit")
+        unsupported_gates: Set of gate names that this engine doesn't support
+        requires_classical_bits: Set to True if engine requires classical bits
 
     Example:
         class TestQiskitTranspiler(TranspilerTestSuite):
-            backend_name = "qiskit"
+            engine_name = "qiskit"
             unsupported_gates = set()
 
             @classmethod
@@ -53,17 +53,17 @@ class TranspilerTestSuite(ABC):
                 return np.array(result.get_statevector())
     """
 
-    backend_name: str
+    engine_name: str
     unsupported_gates: set[str] = set()
     requires_classical_bits: bool = False
 
     @classmethod
     @abstractmethod
     def get_emitter(cls) -> Any:
-        """Get the GateEmitter instance for this backend.
+        """Get the GateEmitter instance for this engine.
 
         Returns:
-            Backend-specific GateEmitter instance
+            Engine-specific GateEmitter instance
         """
         ...
 
@@ -83,7 +83,7 @@ class TranspilerTestSuite(ABC):
         """Run a circuit and extract statevector.
 
         Args:
-            circuit: Backend-specific circuit
+            circuit: Engine-specific circuit
 
         Returns:
             Statevector as numpy array
@@ -92,9 +92,9 @@ class TranspilerTestSuite(ABC):
 
     @classmethod
     def skip_if_unsupported(cls, gate_name: str) -> None:
-        """Skip test if gate is unsupported by this backend."""
+        """Skip test if gate is unsupported by this engine."""
         if gate_name in cls.unsupported_gates:
-            pytest.skip(f"{gate_name} is not supported by {cls.backend_name}")
+            pytest.skip(f"{gate_name} is not supported by {cls.engine_name}")
 
     # =========================================================================
     # Single-qubit gate tests
@@ -483,82 +483,3 @@ class TranspilerTestSuite(ABC):
         # Verify circuit still works
         actual_sv = self.run_circuit_statevector(circuit)
         assert actual_sv is not None
-
-
-class HamiltonianTestMixin:
-    """Mixin for testing Hamiltonian transpilation.
-
-    Add this mixin to test classes that support Hamiltonian transpilation.
-    Requires implementation of `get_transpiler` method.
-    Note: Tests will be skipped if the transpiler doesn't have `transpile_hamiltonian`.
-    """
-
-    @classmethod
-    @abstractmethod
-    def get_transpiler(cls) -> Any:
-        """Get the transpiler instance.
-
-        Returns:
-            Backend-specific transpiler instance
-        """
-        ...
-
-    @classmethod
-    def _skip_if_no_hamiltonian_support(cls) -> None:
-        """Skip test if transpiler doesn't support Hamiltonian transpilation."""
-        transpiler = cls.get_transpiler()
-        if not hasattr(transpiler, "transpile_hamiltonian"):
-            pytest.skip(
-                f"{cls.backend_name} transpiler does not support transpile_hamiltonian"
-            )
-
-    def test_simple_hamiltonian(self) -> None:
-        """Test transpiling a simple single-qubit Hamiltonian."""
-        self._skip_if_no_hamiltonian_support()
-        from qamomile.core.operator import Hamiltonian, X, Z
-
-        h = Hamiltonian()
-        h += 1.0 * X(0)
-        h += 2.0 * Z(1)
-
-        transpiler = self.get_transpiler()
-        result = transpiler.transpile_hamiltonian(h)
-        assert result is not None
-
-    def test_multi_qubit_hamiltonian(self) -> None:
-        """Test transpiling a multi-qubit Hamiltonian."""
-        self._skip_if_no_hamiltonian_support()
-        from qamomile.core.operator import Hamiltonian, X, Y, Z
-
-        h = Hamiltonian()
-        h += X(0) * Z(1)
-        h += Y(0) * Y(1)
-        h += 0.5 * Z(0) * Z(1) * Z(2)
-
-        transpiler = self.get_transpiler()
-        result = transpiler.transpile_hamiltonian(h)
-        assert result is not None
-
-    def test_hamiltonian_with_constant(self) -> None:
-        """Test transpiling a Hamiltonian with a constant term."""
-        self._skip_if_no_hamiltonian_support()
-        from qamomile.core.operator import Hamiltonian, Z
-
-        h = Hamiltonian()
-        h += 1.5 * Z(0)
-        h.constant = 0.5
-
-        transpiler = self.get_transpiler()
-        result = transpiler.transpile_hamiltonian(h)
-        assert result is not None
-
-    def test_empty_hamiltonian(self) -> None:
-        """Test transpiling an empty Hamiltonian."""
-        self._skip_if_no_hamiltonian_support()
-        from qamomile.core.operator import Hamiltonian
-
-        h = Hamiltonian()
-
-        transpiler = self.get_transpiler()
-        result = transpiler.transpile_hamiltonian(h)
-        assert result is not None

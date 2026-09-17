@@ -4,13 +4,14 @@ Extracted from ``standard_emit.py`` to isolate the Hamiltonian
 decomposition logic from the main emit dispatch.
 
 The ``emit_pauli_evolve`` function is the **default** implementation.
-Backend-specific emit passes (e.g., ``QiskitEmitPass``) may override
+Engine-specific emit passes (e.g., ``QiskitEmitPass``) may override
 the corresponding ``_emit_pauli_evolve`` method; calling
 ``super()._emit_pauli_evolve(...)`` will ultimately delegate here.
 """
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -19,8 +20,14 @@ if TYPE_CHECKING:
 from qamomile.circuit.ir.operation.pauli_evolve import PauliEvolveOp
 from qamomile.circuit.ir.value import ArrayValue
 from qamomile.circuit.transpiler.errors import EmitError
-from qamomile.observable.hamiltonian import HERMITIAN_IMAG_ATOL, PAULI_TERM_ZERO_ATOL
+from qamomile.observable.hamiltonian import (
+    HERMITIAN_IMAG_ATOL,
+    PAULI_TERM_ZERO_ATOL,
+    Hamiltonian,
+)
 
+from .gate_emission import resolve_angle_value
+from .global_phase_emission import emit_resolved_global_phase, is_exact_real_zero
 from .qubit_address import QubitAddress, QubitMap
 
 
@@ -28,41 +35,116 @@ def _resolve_gamma(
     emit_pass: "StandardEmitPass",
     op: PauliEvolveOp,
     bindings: dict[str, Any],
-) -> float | Any | None:
-    """Resolve a PauliEvolveOp gamma operand to a concrete float or backend Parameter.
+) -> Any:
+    """Resolve gamma with the canonical angle-resolution contract.
 
-    Resolution order:
-        1. **parameter array element fast path** — when ``gamma`` is
-           ``arr[idx]`` and ``arr`` is in ``parameters``, return a
-           backend Parameter. Takes priority over concrete bindings
-           because users often pass concrete arrays as a shape hint.
-        2. constant / concrete binding / scalar parameter → Python
-           float or backend Parameter as appropriate.
+    Pauli evolution accepts the same concrete, declared-parameter, and
+    emit-time symbolic expressions as rotation gates and global phase. In
+    particular, a loop-carried gamma may already be an engine expression and
+    must not be rejected merely because it is not a Python ``float``.
 
-    Returns ``None`` when none apply; the caller converts that into
-    an ``EmitError``.
+    Args:
+        emit_pass (StandardEmitPass): Active emit pass providing angle
+            resolution and engine parameter construction.
+        op (PauliEvolveOp): Pauli evolution whose gamma is resolved.
+        bindings (dict[str, Any]): Active emit-time bindings.
+
+    Returns:
+        Any: Concrete float or engine symbolic angle expression.
+
+    Raises:
+        EmitError: If gamma cannot be represented as an angle.
     """
-    theta = op.gamma
-    parameters = emit_pass._resolver.parameters
+    return resolve_angle_value(emit_pass, op.gamma, bindings)
 
-    # Fast path: ``arr[idx]`` where ``arr`` is a declared parameter.
-    if theta.parent_array is not None and theta.parent_array.name in parameters:
-        param_key = emit_pass._resolver.get_parameter_key(theta, bindings)
-        if param_key:
-            return emit_pass._get_or_create_parameter(param_key, theta.uuid)
 
-    # Scalar declared parameter.
-    if theta.name in parameters:
-        param_key = emit_pass._resolver.get_parameter_key(theta, bindings)
-        if param_key:
-            return emit_pass._get_or_create_parameter(param_key, theta.uuid)
+def is_zero_evolution_time(gamma: Any) -> bool:
+    """Return whether a resolved evolution time is the numeric identity.
 
-    # Constant / concrete binding.
-    concrete = emit_pass._resolver.resolve_classical_value(theta, bindings)
-    if concrete is not None and isinstance(concrete, (int, float)):
-        return float(concrete)
+    Python and NumPy real scalars share the same rule. Engine parameter
+    objects deliberately remain nonzero here: their runtime value is unknown
+    even if they support comparison with Python numbers.
 
-    return None
+    Args:
+        gamma (Any): Concrete float or engine-native parameter expression.
+
+    Returns:
+        bool: ``True`` only for a concrete numeric zero.
+    """
+    return is_exact_real_zero(gamma)
+
+
+def validate_hermitian_hamiltonian(hamiltonian: Hamiltonian) -> None:
+    """Validate every coefficient before Pauli-evolution emission starts.
+
+    This validation deliberately completes before the zero-time shortcut and
+    before any circuit mutation. Consequently, malformed Hamiltonians fail
+    consistently for controlled and uncontrolled evolution, and a late
+    invalid term cannot leave a partially emitted circuit behind.
+
+    Args:
+        hamiltonian (Hamiltonian): Hamiltonian whose constant and Pauli-term
+            coefficients must be real within ``HERMITIAN_IMAG_ATOL``.
+
+    Raises:
+        EmitError: If the constant or any Pauli-term coefficient is non-finite
+            or has an imaginary component outside the Hermiticity tolerance.
+    """
+    constant = complex(hamiltonian.constant)
+    if not math.isfinite(constant.real) or not math.isfinite(constant.imag):
+        raise EmitError(
+            "PauliEvolveOp requires finite Hamiltonian coefficients, but "
+            f"found constant {hamiltonian.constant}.",
+            operation="PauliEvolveOp",
+        )
+    if abs(constant.imag) > HERMITIAN_IMAG_ATOL:
+        raise EmitError(
+            "PauliEvolveOp requires a Hermitian Hamiltonian (real "
+            f"coefficients), but found complex constant {hamiltonian.constant}.",
+            operation="PauliEvolveOp",
+        )
+    for operators, coefficient in hamiltonian:
+        numeric_coefficient = complex(coefficient)
+        if not math.isfinite(numeric_coefficient.real) or not math.isfinite(
+            numeric_coefficient.imag
+        ):
+            raise EmitError(
+                "PauliEvolveOp requires finite Hamiltonian coefficients, but "
+                f"found coefficient {coefficient} on term {operators}.",
+                operation="PauliEvolveOp",
+            )
+        if abs(numeric_coefficient.imag) > HERMITIAN_IMAG_ATOL:
+            raise EmitError(
+                "PauliEvolveOp requires a Hermitian Hamiltonian "
+                "(real coefficients), but found complex coefficient "
+                f"{coefficient} on term {operators}.",
+                operation="PauliEvolveOp",
+            )
+
+
+def _scale_gamma(gamma: Any, factor: float) -> Any:
+    """Scale a concrete or target-native evolution parameter.
+
+    Args:
+        gamma (Any): Resolved evolution time.
+        factor (float): Real coefficient multiplying ``gamma``.
+
+    Returns:
+        Any: Scaled concrete or target-native angle.
+
+    Raises:
+        EmitError: If the target parameter does not support real scaling.
+    """
+    try:
+        return factor * gamma
+    except TypeError as exc:
+        raise EmitError(
+            "Pauli evolution requires a compile-time-numeric gamma on this "
+            "target because its runtime parameter type cannot express the "
+            "required angle scaling. Bind gamma to a concrete value before "
+            "transpilation.",
+            operation="PauliEvolveOp",
+        ) from exc
 
 
 def validate_hamiltonian_within_register(
@@ -75,9 +157,9 @@ def validate_hamiltonian_within_register(
     into the register's qubit space (identity on the untouched qubits)
     by acting only on its declared qubits; only a Hamiltonian *larger*
     than the register is a genuine error. Every ``PauliEvolveOp`` emit
-    path (shared, backend-native, and controlled) must apply this same
+    path (shared, engine-native, and controlled) must apply this same
     rule through this helper so the size contract cannot drift between
-    backends.
+    engines.
 
     Args:
         num_h_qubits (int): Number of qubits the Hamiltonian acts on
@@ -99,6 +181,50 @@ def validate_hamiltonian_within_register(
         )
 
 
+def _map_pauli_evolve_results(
+    emit_pass: "StandardEmitPass",
+    op: PauliEvolveOp,
+    qubit_indices: list[int],
+    qubit_map: QubitMap,
+    bindings: dict[str, Any],
+) -> None:
+    """Map an evolved register to the unchanged physical input qubits.
+
+    Args:
+        emit_pass (StandardEmitPass): Active emit pass.
+        op (PauliEvolveOp): Evolution operation whose result is mapped.
+        qubit_indices (list[int]): Physical input qubits acted on by the
+            Hamiltonian.
+        qubit_map (QubitMap): Mutable semantic-to-physical mapping.
+        bindings (dict[str, Any]): Active emit-time bindings.
+
+    Returns:
+        None: ``qubit_map`` is updated in place.
+
+    Raises:
+        EmitError: If the evolved register's slice chain cannot be resolved.
+    """
+    result_array = op.evolved_qubits
+    assert isinstance(result_array, ArrayValue)
+    result_root, result_start, result_step = emit_pass._resolver.resolve_slice_chain(
+        result_array,
+        bindings,
+        operation="PauliEvolveOp",
+    )
+    for index, physical_index in enumerate(qubit_indices):
+        qubit_map.setdefault(
+            QubitAddress(result_array.uuid, index),
+            physical_index,
+        )
+        qubit_map.setdefault(
+            QubitAddress(
+                result_root.uuid,
+                result_start + result_step * index,
+            ),
+            physical_index,
+        )
+
+
 def emit_pauli_evolve(
     emit_pass: "StandardEmitPass",
     circuit: Any,
@@ -114,7 +240,7 @@ def emit_pauli_evolve(
     2. CNOT ladder + RZ
     3. Undo basis change
 
-    Subclasses can override this for backend-native implementations
+    Subclasses can override this for engine-native implementations
     (e.g., Qiskit PauliEvolutionGate).
     """
     import qamomile.observable as qm_o
@@ -130,17 +256,10 @@ def emit_pauli_evolve(
         )
 
     # Resolve gamma. When gamma is a parameter (scalar or array element),
-    # obtain a backend Parameter so that the per-term RZ angles are
-    # emitted as parametric expressions (`2 * coeff * backend_param`),
+    # obtain an engine Parameter so that the per-term RZ angles are
+    # emitted as parametric expressions (`2 * coeff * engine_param`),
     # matching how ``ising_cost`` handles parametric gamma directly.
     gamma = _resolve_gamma(emit_pass, op, bindings)
-    if gamma is None:
-        raise EmitError(
-            "Cannot resolve gamma parameter for PauliEvolveOp. "
-            "gamma must be a concrete float binding or a declared "
-            "parameter (scalar or array element).",
-            operation="PauliEvolveOp",
-        )
 
     # Validate qubit count: logical array size vs Hamiltonian. A smaller
     # Hamiltonian is embedded by acting only on its declared qubits below.
@@ -154,15 +273,10 @@ def emit_pauli_evolve(
         if n_resolved is not None:
             validate_hamiltonian_within_register(num_h_qubits, n_resolved)
 
-    # Validate Hermitian (real coefficients)
-    for operators, coeff in hamiltonian:
-        if abs(coeff.imag) > HERMITIAN_IMAG_ATOL:
-            raise EmitError(
-                f"PauliEvolveOp requires a Hermitian Hamiltonian "
-                f"(real coefficients), but found complex coefficient "
-                f"{coeff} on term {operators}.",
-                operation="PauliEvolveOp",
-            )
+    # Complete validation before the zero-time shortcut or any circuit
+    # mutation. The later emission pass is intentionally a second traversal.
+    validate_hermitian_hamiltonian(hamiltonian)
+    constant = complex(hamiltonian.constant)
 
     # Resolve qubit indices from the input array. For a sliced view
     # (``pauli_evolve(q[1::2], H, gamma)``) walk the ``slice_of`` chain
@@ -183,24 +297,41 @@ def emit_pauli_evolve(
                 operation="PauliEvolveOp",
             )
 
+    if is_zero_evolution_time(gamma):
+        _map_pauli_evolve_results(
+            emit_pass,
+            op,
+            qubit_indices,
+            qubit_map,
+            bindings,
+        )
+        return
+
+    if constant.real:
+        emit_resolved_global_phase(
+            emit_pass,
+            circuit,
+            _scale_gamma(gamma, -float(constant.real)),
+        )
+
     # Emit each Hamiltonian term using the Pauli gadget technique
     for operators, coeff in hamiltonian:
         if abs(coeff) < PAULI_TERM_ZERO_ATOL:
             continue
+        if not operators:
+            emit_resolved_global_phase(
+                emit_pass,
+                circuit,
+                _scale_gamma(gamma, -float(coeff.real)),
+            )
+            continue
         # RZ(theta) = exp(-i*theta*Z/2), so to get exp(-i*gamma*c*P)
         # we need theta = 2*gamma*c. Works for both concrete gamma
         # (float * float) and parametric gamma (float * Parameter),
-        # relying on backend Parameter arithmetic.
-        angle: Any
-        if isinstance(gamma, (int, float)):
-            angle = 2.0 * float(coeff.real * gamma)
-        else:
-            angle = (2.0 * float(coeff.real)) * gamma
+        # relying on engine Parameter arithmetic.
+        angle = _scale_gamma(gamma, 2.0 * float(coeff.real))
         term_qubit_indices = [qubit_indices[op_item.index] for op_item in operators]
         pauli_types = [op_item.pauli for op_item in operators]
-
-        if len(operators) == 0:
-            continue
 
         # Step 1: Basis change
         for qi, pi in zip(term_qubit_indices, pauli_types):
@@ -241,19 +372,10 @@ def emit_pauli_evolve(
                 emit_pass._emitter.emit_s(circuit, qi)
             # Z and I: no basis change
 
-    # Map result array to same physical qubits. Resolve the result's
-    # own slice chain so downstream ``resolve_qubit_index_detailed``
-    # callers that walk to the root find the registered mapping, while
-    # direct lookups via the result array's own uuid also still work.
-    result_array = op.evolved_qubits
-    assert isinstance(result_array, ArrayValue)
-    result_root, result_start, result_step = emit_pass._resolver.resolve_slice_chain(
-        result_array, bindings, operation="PauliEvolveOp"
+    _map_pauli_evolve_results(
+        emit_pass,
+        op,
+        qubit_indices,
+        qubit_map,
+        bindings,
     )
-    for i, phys_idx in enumerate(qubit_indices):
-        direct_addr = QubitAddress(result_array.uuid, i)
-        if direct_addr not in qubit_map:
-            qubit_map[direct_addr] = phys_idx
-        root_addr = QubitAddress(result_root.uuid, result_start + result_step * i)
-        if root_addr not in qubit_map:
-            qubit_map[root_addr] = phys_idx

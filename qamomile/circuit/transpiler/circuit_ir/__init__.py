@@ -1,4 +1,4 @@
-"""Backend-neutral circuit code-generation IR.
+"""Engine-neutral circuit code-generation IR.
 
 This module is intentionally lower-level than Qamomile's semantic IR and
 higher-level than any SDK object. It contains virtual quantum wires,
@@ -35,9 +35,11 @@ from qamomile.circuit.transpiler.circuit_ir.capability import (
     ARITHMETIC_BINARY_OPERATORS,
     DEFAULT_POLICY,
     CallControlMode,
+    CallPhaseMode,
     CallTransformCapabilities,
     CircuitCapabilities,
     CompilationPolicy,
+    GlobalPhaseCapabilities,
     NativeSemanticOpCapabilities,
     ScalarAtom,
     ScalarCapabilities,
@@ -53,7 +55,7 @@ from qamomile.circuit.transpiler.circuit_ir.lowering import (
     lower_circuit_plan,
 )
 from qamomile.circuit.transpiler.circuit_ir.materialize import (
-    CircuitBackendEmitPass,
+    CircuitEngineEmitPass,
     CircuitMaterializer,
     MaterializedCircuit,
     materialize_executable,
@@ -63,6 +65,7 @@ from qamomile.circuit.transpiler.circuit_ir.model import (
     MULTI_CONTROLLED_X_SEMANTIC_KEY,
     QFT_SEMANTIC_KEY,
     RIPPLE_CARRY_ADD_SEMANTIC_KEY,
+    SELECT_SEMANTIC_KEY,
     STATE_PREPARATION_SEMANTIC_KEY,
     BarrierInstruction,
     BinaryExpr,
@@ -92,6 +95,7 @@ from qamomile.circuit.transpiler.circuit_ir.model import (
     UnaryOperator,
     WhileInstruction,
     WireId,
+    has_mid_circuit_measurement,
 )
 from qamomile.circuit.transpiler.circuit_ir.verify import verify_circuit
 
@@ -106,9 +110,10 @@ __all__ = [
     "CallableIdentity",
     "CallInstruction",
     "CallControlMode",
+    "CallPhaseMode",
     "CallTransformCapabilities",
     "CircuitBuilder",
-    "CircuitBackendEmitPass",
+    "CircuitEngineEmitPass",
     "CircuitCapabilities",
     "CircuitGateEmitter",
     "CircuitLoweringPass",
@@ -120,6 +125,7 @@ __all__ = [
     "DEFAULT_POLICY",
     "ForInstruction",
     "GateInstruction",
+    "GlobalPhaseCapabilities",
     "IfInstruction",
     "LiteralExpr",
     "LoopVariableExpr",
@@ -134,6 +140,7 @@ __all__ = [
     "IQFT_SEMANTIC_KEY",
     "MULTI_CONTROLLED_X_SEMANTIC_KEY",
     "RIPPLE_CARRY_ADD_SEMANTIC_KEY",
+    "SELECT_SEMANTIC_KEY",
     "STATE_PREPARATION_SEMANTIC_KEY",
     "ResetInstruction",
     "ReusableCircuit",
@@ -148,6 +155,7 @@ __all__ = [
     "WhileInstruction",
     "WireId",
     "legalize_program",
+    "has_mid_circuit_measurement",
     "verify_circuit",
     "verify_target_legal",
     "lower_circuit_plan",

@@ -36,7 +36,7 @@
 
 # %%
 # Install the latest Qamomile through pip!
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit,visualization]"
 
 # %% [markdown]
 # ## 1. The Pipeline at a Glance
@@ -53,7 +53,7 @@
 # Block [HIERARCHICAL]
 #    │  substitute                  (optional rule-based replacement)
 #    │  resolve_parameter_shapes    (concretise Vector shape dims)
-#    │  inline                      (remove CallBlockOperations)
+#    │  inline                      (remove InvokeOperations)
 #    ▼
 # Block [AFFINE]
 #    │  unroll_recursion            (iterated inline ↔ partial_eval)
@@ -68,7 +68,7 @@
 #    │  plan                        (segment into C→Q→C)
 #    ▼
 # ProgramPlan
-#    │  emit                        (backend-specific code generation)
+#    │  emit                        (engine-specific code generation)
 #    ▼
 # ExecutableProgram[T]
 # ```
@@ -134,7 +134,7 @@
 # `logical_id` is a stable identifier that says "this is still the same
 # logical variable across SSA versions" — e.g. `q = qmc.h(q)` creates a new
 # `Value` whose `logical_id` matches the old one. It is **not** a mapping to
-# a physical qubit; backend qubit allocation happens later in `emit` via the
+# a physical qubit; engine qubit allocation happens later in `emit` via the
 # `ResourceAllocator`. The same mechanism is reused for classical values
 # such as `Float` parameters and `Bit` measurement results.
 #
@@ -148,7 +148,7 @@
 # | `GateOperation` | `H`, `RX`, `CX`, … | `ir/operation/gate.py` |
 # | `MeasureOperation` | Measurement | `ir/operation/measurement.py` |
 # | `ForOperation`, `IfOperation`, `WhileOperation` | Control flow | `ir/operation/control_flow.py` |
-# | `CallBlockOperation` | Call to another `Block` (removed by `inline`) | `ir/operation/call_block_ops.py` |
+# | `InvokeOperation` | Call to another `Block` (removed by `inline`) | `ir/operation/callable.py` |
 #
 # All control-flow ops implement the `HasNestedOps` protocol
 # (`nested_op_lists()` / `rebuild_nested()`) so passes can walk into loop and
@@ -161,7 +161,7 @@
 # %%
 import qamomile.circuit as qmc
 from qamomile.circuit.ir import pretty_print_block
-from qamomile.circuit.ir.operation.call_block_ops import CallBlockOperation
+from qamomile.circuit.ir.operation.callable import InvokeOperation
 from qamomile.circuit.ir.operation.control_flow import ForOperation
 from qamomile.qiskit import QiskitTranspiler
 
@@ -202,7 +202,7 @@ def demo_kernel(n: qmc.UInt, theta: qmc.Float) -> qmc.Vector[qmc.Bit]:
 
 # %% [markdown]
 # We will transpile with `n=3` bound at compile time and `theta` kept as a
-# backend parameter.
+# engine parameter.
 
 
 # %%
@@ -223,7 +223,7 @@ def summarise(block):
 # `qamomile.circuit.ir.pretty_print_block` returns an MLIR-style textual
 # dump of the block — the fastest way to see *what changed* between two
 # passes. The `depth` argument controls how many layers of
-# `CallBlockOperation` to expand inline, so e.g. `depth=1` previews what
+# `InvokeOperation` to expand inline, so e.g. `depth=1` previews what
 # `inline` will produce without running it.
 
 # %% [markdown]
@@ -238,7 +238,7 @@ def summarise(block):
 # `to_block` executes the decorated function under a tracer context. Every
 # `qmc.h(...)`, `qmc.range(...)`, and `entangle_pair(...)` call records an
 # `Operation` into the Block. Calls to other `@qkernel`s become
-# `CallBlockOperation`s — the body is **not** inlined yet.
+# `InvokeOperation`s — the body is **not** inlined yet.
 
 # %%
 bindings = {"n": 3}
@@ -250,10 +250,10 @@ assert block.kind.name == "HIERARCHICAL"
 print("parameters:       ", list(block.parameters))
 assert list(block.parameters) == ["theta"]
 print(
-    "CallBlockOps:     ",
-    sum(1 for op in block.operations if isinstance(op, CallBlockOperation)),
+    "InvokeOps:     ",
+    sum(1 for op in block.operations if isinstance(op, InvokeOperation)),
 )
-# Note: `CallBlockOperation`s may live inside a `ForOperation` body too —
+# Note: `InvokeOperation`s may live inside a `ForOperation` body too —
 # they are not necessarily in the top-level list.
 
 # %% [markdown]
@@ -265,7 +265,7 @@ print(
 print(pretty_print_block(block))
 
 # %% [markdown]
-# With `depth=1`, the `CallBlockOperation` is expanded inside its call line
+# With `depth=1`, the `InvokeOperation` is expanded inside its call line
 # — the same shape `inline` will produce in the next stage, so you can
 # preview it without actually running the pass.
 
@@ -280,16 +280,16 @@ print(pretty_print_block(block, depth=1))
 #
 # ### 4.2 `inline` — flattening nested block calls
 #
-# `inline` replaces every `CallBlockOperation` with the operations of the
+# `inline` replaces every `InvokeOperation` with the operations of the
 # target block, substituting SSA values so the result stays well-formed. Once
-# no `CallBlockOperation` remains, the block transitions to `AFFINE`.
+# no `InvokeOperation` remains, the block transitions to `AFFINE`.
 
 
 # %%
 def count_calls(ops):
     total = 0
     for op in ops:
-        if isinstance(op, CallBlockOperation):
+        if isinstance(op, InvokeOperation):
             total += 1
         # Walk nested control-flow bodies so we count calls inside loops.
         for child in getattr(op, "nested_op_lists", lambda: [])():
@@ -300,7 +300,7 @@ def count_calls(ops):
 block = transpiler.inline(block)
 print("after inline:     ", summarise(block))
 assert block.kind.name == "AFFINE"
-print("CallBlockOps (deep):", count_calls(block.operations))
+print("InvokeOps (deep):", count_calls(block.operations))
 assert count_calls(block.operations) == 0
 print("is_affine:        ", block.is_affine())
 assert block.is_affine()
@@ -370,13 +370,13 @@ assert sum(1 for op in block.operations if isinstance(op, ForOperation)) == 1
 # 2. No **`OperationKind.QUANTUM`** operation receives a **classical-typed
 #    operand** whose value was computed from a measurement — concretely, the
 #    rotation angle in `rx(q, theta)` cannot be a classical value derived
-#    from an earlier measurement, because the backend would have to JIT a
+#    from an earlier measurement, because the engine would have to JIT a
 #    classical computation between measurement and gate.
 #
 # This rule **does not forbid dynamic quantum circuits**: `IfOperation` and
 # `WhileOperation` are `OperationKind.CONTROL`, not QUANTUM, so control flow
 # conditioned on a measurement `Bit` (`if bit: ...`, `while bit: ...`)
-# passes the check. Quantum-typed values that survive a phi merge are also
+# passes the check. Quantum-typed values that survive an if-merge are also
 # explicitly exempt. Section 5 walks through which dynamic patterns are
 # allowed and which are rejected, with code examples.
 #
@@ -409,14 +409,14 @@ assert list(plan.parameters) == ["theta"]
 
 # %% [markdown]
 # The quantum segment also carries `qubit_values` and `num_qubits` so `emit`
-# knows how many qubit lines the backend circuit needs before it starts
+# knows how many qubit lines the engine circuit needs before it starts
 # placing gates.
 #
-# ### 4.6 `emit` — backend-specific code generation
+# ### 4.6 `emit` — engine-specific code generation
 #
-# `emit` hands the plan to an `EmitPass` for the target backend. The emit pass
+# `emit` hands the plan to an `EmitPass` for the target engine. The emit pass
 # allocates concrete qubit indices, then walks the quantum segment and calls
-# the backend's `GateEmitter` protocol methods (`emit_h`, `emit_rx`, …) to
+# the engine's `GateEmitter` protocol methods (`emit_h`, `emit_rx`, …) to
 # construct a native circuit.
 
 # %%
@@ -453,10 +453,12 @@ print(executable.quantum_circuit)
 #   construction time, but views whose bounds were symbolic at trace time
 #   (`q[lo:hi]` for a `UInt lo` / `hi`) can only be checked once `bindings`
 #   make the bounds concrete. This pass walks the block after
-#   `partial_eval` and raises `SliceBorrowViolationError` on overlapping
-#   live views or use-after-destroy (a view's covered slot accessed after
-#   it was destroyed by an earlier `measure` / `cast` / `expval`). Slice
-#   views are treated as **affine** at the kernel boundary: a view left
+#   `partial_eval`. It raises `QubitBorrowConflictError` for overlapping live
+#   views and `QubitConsumedError` for use-after-destroy (a view's covered
+#   slot accessed after it was destroyed by an earlier `measure` / `cast` /
+#   `expval`). These are the same semantic errors raised by the frontend for
+#   concrete slice bounds. Slice views are treated as **affine** at the kernel
+#   boundary: a view left
 #   live at block end without being slice-assigned back is *not* flagged
 #   here — natural ancilla / scratch-register patterns (Deutsch-Jozsa's
 #   `ancilla = qs[n]`, Simon's `qs2 = qs[n:2*n]`) compile cleanly. The
@@ -485,7 +487,7 @@ print(executable.quantum_circuit)
 # ## 5. Control Flow (`if` / `for` / `while`) Through the Pipeline
 #
 # How the pipeline handles control flow spans several layers — what the
-# frontend accepts, how each pass transforms it, and whether the backend
+# frontend accepts, how each pass transforms it, and whether the engine
 # supports runtime branching. This section ties those layers together. See
 # [tutorial 07](07_classical_flow_patterns) for the user-facing patterns;
 # here we focus on the compiler's view.
@@ -522,15 +524,18 @@ print(executable.quantum_circuit)
 # |-----------|-------------|--------------------|-------|
 # | `ForOperation` | `operations` (body) | `operands = [start, stop, step]` (all `UInt`) | carries `loop_var` name |
 # | `ForItemsOperation` | `operations` (body) | `operands[0]` is a `DictValue` | always unrolled at transpile time |
-# | `IfOperation` | `true_operations`, `false_operations` | `operands[0]` is a `Bit` | `phi_ops` merge values post-branch |
+# | `IfOperation` | `true_operations`, `false_operations` | `operands[0]` is a `Bit` | `true_yields` / `false_yields` merge values post-branch |
 # | `WhileOperation` | `operations` (body) | `operands[0]` (initial), `operands[1]` (loop-carried) | measurement-backed `Bit` required; optional `max_iterations` hint |
 #
 # All four implement `HasNestedOps`, so passes walk into bodies uniformly via
 # `nested_op_lists()` / `rebuild_nested()` — no isinstance chains.
 #
-# `IfOperation` carries **Phi nodes** (`PhiOp`) to merge values. When both
-# branches update the same logical value, readers past the if refer through
-# the phi to know which branch's version they get.
+# `IfOperation` merges values through its parallel **`true_yields` /
+# `false_yields`** lists: `true_yields[i]` and `false_yields[i]` are the
+# branch values merged into `results[i]`. When both branches update the same
+# logical value, readers past the if refer to the merged result to know which
+# branch's version they get. Passes read the merges through
+# `IfOperation.iter_merges()` rather than touching the yield lists directly.
 #
 # ### 5.3 Per-Pass Behavior
 #
@@ -538,10 +543,10 @@ print(executable.quantum_circuit)
 # |------|-------------|---------------|-----------------|
 # | `inline` | recurses into both branch bodies | recurses into body | recurses into body |
 # | `partial_eval` | constant condition → **replaced by selected branch** (`CompileTimeIfLoweringPass`); measurement condition preserved | bound `BinOp`s folded. **No unrolling** | untouched here |
-# | `analyze` | phi edges enter the dependency graph | `loop_var` enters body deps | measurement-condition treated like a quantum operand |
+# | `analyze` | merge edges enter the dependency graph | `loop_var` enters body deps | measurement-condition treated like a quantum operand |
 # | `validate_symbolic_shapes` | — | unresolved `Vector` shape dim as a bound → rejected | — |
 # | `plan` | `OperationKind.CONTROL` — creates a segment boundary | same | same |
-# | `emit` | emitted as runtime `if` if the backend supports it | `LoopAnalyzer.should_unroll()` decides unroll vs native-loop | emitted as runtime `while` |
+# | `emit` | emitted as runtime `if` if the engine supports it | `LoopAnalyzer.should_unroll()` decides unroll vs native-loop | emitted as runtime `while` |
 #
 # **`LoopAnalyzer.should_unroll()`**
 # (`transpiler/passes/emit_support/loop_analyzer.py`) unrolls when:
@@ -554,7 +559,7 @@ print(executable.quantum_circuit)
 # fire and the loop is unrolled at emit time — that's why
 # `executable.quantum_circuit` is a flat sequence of CXs for two iterations.
 # A loop that hits none of these stays in the circuit as a native runtime
-# loop for backends that support it.
+# loop for engines that support it.
 #
 # ### 5.4 Quantum ↔ Classical Dependency Rule (`analyze`)
 #
@@ -578,10 +583,10 @@ print(executable.quantum_circuit)
 # compilation, which Qamomile does not support today. The `plan` stage
 # enforcing a single quantum segment is the other side of this guarantee.
 #
-# ### 5.5 Backend Runtime-Branching Support
+# ### 5.5 Engine Runtime-Branching Support
 #
 # Whether runtime `if` / `while` survives into the emitted circuit depends
-# on the backend's `MeasurementMode`
+# on the engine's `MeasurementMode`
 # (`qamomile/circuit/transpiler/gate_emitter.py`):
 #
 # | Mode | Runtime if/while | Example |
@@ -591,7 +596,7 @@ print(executable.quantum_circuit)
 # | `RUNNABLE` | Fully supported, including runtime loops / branches | CUDA-Q (`cudaq.run()` path) |
 #
 # Compiling a kernel that contains an `IfOperation` / `WhileOperation` on a
-# non-supporting backend will raise at emit time. It is up to the
+# non-supporting engine will raise at emit time. It is up to the
 # contributor to know which mode applies when writing runtime branching.
 #
 # ### 5.6 Common Errors
@@ -606,7 +611,7 @@ print(executable.quantum_circuit)
 #   `Vector` shape dim reached a `ForOperation` bound. Concretise the
 #   `Vector` via `bindings`, or switch to `qmc.items`.
 # - **Emit-time error** — a runtime `if` reached a `MeasurementMode.STATIC`
-#   backend. Switch backend, or express the kernel differently.
+#   engine. Switch engine, or express the kernel differently.
 
 # %% [markdown]
 # ## 6. Case Study: How `MeasureQFixed` Gets Compiled
@@ -655,7 +660,7 @@ print(pretty_print_block(qfixed_block))
 # %% [markdown]
 # The trailing operation is a single `measure_qfixed`, with the
 # `cast %q to QFixed[0.3]` immediately above it. `MeasureQFixedOperation`
-# carries `operation_kind=HYBRID`; real backends only have quantum-side
+# carries `operation_kind=HYBRID`; real engines only have quantum-side
 # measurement instructions, so somewhere in the pipeline the
 # "measure N qubits" and "decode bits to float" halves must be pulled
 # apart.
@@ -699,7 +704,7 @@ print(pretty_print_block(lowered))
 # After lowering, the `ProgramPlan` lays out (conceptually):
 #
 # - **QuantumStep** (quantum segment): the gate sequence plus the
-#   `MeasureVectorOperation`. The backend's `emit_measure_vector` iterates
+#   `MeasureVectorOperation`. The engine's `emit_measure_vector` iterates
 #   the qubits and issues a normal per-qubit `emit_measure`, writing
 #   results into classical registers.
 # - **ClassicalStep (role=`post`)** (classical segment): just the
@@ -707,7 +712,7 @@ print(pretty_print_block(lowered))
 #   `qamomile/circuit/transpiler/classical_executor.py` takes the
 #   measured bit string and decodes it to a Float.
 #
-# From the backend's point of view there is no "QFixed measurement"
+# From the engine's point of view there is no "QFixed measurement"
 # instruction; the abstraction exists only in Qamomile's IR. The
 # quantum hardware only ever sees ordinary measurement instructions.
 #
@@ -719,7 +724,7 @@ print(pretty_print_block(lowered))
 # | `inline` / `partial_eval` / `analyze` | passes through | — | — |
 # | `plan` (pre-segmentation lowering) | **split and removed** | **created here** | **created here** |
 # | `emit` | — | per-qubit `emit_measure` | not touched (lives in the classical step) |
-# | runtime | — | backend runner executes measurements | `classical_executor` decodes bits to Float |
+# | runtime | — | engine runner executes measurements | `classical_executor` decodes bits to Float |
 #
 # Together with `CastOperation` (which re-labels a value's type without
 # allocating fresh qubits), this is a clean illustration of Qamomile's
@@ -727,9 +732,9 @@ print(pretty_print_block(lowered))
 # disturbing the quantum resources" design pattern.
 
 # %% [markdown]
-# ## 7. Backend Emission: Qiskit vs QURI Parts
+# ## 7. Engine Emission: Qiskit vs QURI Parts
 #
-# Every backend plugs into the pipeline by implementing two protocols defined
+# Every engine plugs into the pipeline by implementing two protocols defined
 # in `qamomile/circuit/transpiler/`:
 #
 # - **`GateEmitter[T]`** (`gate_emitter.py`): the "how do I draw a gate" API.
@@ -740,12 +745,12 @@ print(pretty_print_block(lowered))
 #
 #   | Mode | Meaning | Used by |
 #   |------|---------|---------|
-#   | `NATIVE` | Backend has an explicit measurement instruction the emit pass should call. | Qiskit |
-#   | `STATIC` | Backend takes the unmeasured state vector/operator; the sampler handles measurement externally. | QURI Parts |
-#   | `RUNNABLE` | Backend supports mid-circuit measurement with runtime control flow. | CUDA-Q (`cudaq.run()` path) |
+#   | `NATIVE` | Engine has an explicit measurement instruction the emit pass should call. | Qiskit |
+#   | `STATIC` | Engine takes the unmeasured state vector/operator; the sampler handles measurement externally. | QURI Parts |
+#   | `RUNNABLE` | Engine supports mid-circuit measurement with runtime control flow. | CUDA-Q (`cudaq.run()` path) |
 #
 # - **`CompositeGateEmitter[C]`** (`passes/emit.py`): optional. Lets a
-#   backend short-circuit composite gates (QFT, QPE, …) with a native
+#   engine short-circuit composite gates (QFT, QPE, …) with a native
 #   implementation. The `can_emit(gate_type) -> bool` / `emit(...) -> bool`
 #   contract returns `False` to opt out, in which case the emit pass falls
 #   back to the library-level decomposition.
@@ -768,7 +773,7 @@ try:
         demo_kernel, bindings=bindings, parameters=parameters
     )
 
-    print("backend circuit type: ", type(quri_exe.quantum_circuit).__name__)
+    print("engine circuit type: ", type(quri_exe.quantum_circuit).__name__)
     assert type(quri_exe.quantum_circuit).__name__ == "LinearMappedParametricQuantumCircuit"
     print("parameter_names:      ", quri_exe.parameter_names)
     assert list(quri_exe.parameter_names) == ["theta"]
@@ -793,9 +798,9 @@ except ModuleNotFoundError:
 #    (`measurement_mode=STATIC`).
 # 3. **Composite gates.** If the kernel used `qmc.qft(...)`, Qiskit's
 #    `QiskitQFTEmitter` would drop in a `QFTGate` box, whereas the QURI Parts
-#    backend decomposes via the library pass — same IR, different realised
+#    engine decomposes via the library pass — same IR, different realised
 #    circuit. You can override this per kernel via
-#    `TranspilerConfig.with_strategies({"qft": "approximate"})`.
+#    `TranspilerConfig.with_strategies({"qft": "approximate_k2"})`.
 
 # %% [markdown]
 # ## 8. Pointers for Contributors
@@ -816,7 +821,7 @@ except ModuleNotFoundError:
 #     return new_ops
 # ```
 #
-# **Adding a new backend.** Minimum checklist:
+# **Adding a new engine.** Minimum checklist:
 #
 # 1. Implement `GateEmitter[T]` for your target SDK (`T` is the SDK's circuit
 #    type). Start from `qamomile/qiskit/emitter.py`.
@@ -833,7 +838,7 @@ except ModuleNotFoundError:
 # stage where `BlockKind` fails to advance, the operation count explodes,
 # or an exception is raised is the stage you should look at first. Varying
 # `pretty_print_block(block, depth=N)` before and after `inline` makes it
-# much easier to spot where a value got disconnected or a phi got dropped.
+# much easier to spot where a value got disconnected or a merge got dropped.
 
 # %% [markdown]
 # ## 9. Summary
@@ -848,7 +853,7 @@ except ModuleNotFoundError:
 # Each pass has a narrow job and a precondition on `BlockKind`. The step-by-step
 # API on `Transpiler` exposes every pass publicly — treat it as your primary
 # debugging tool when a kernel misbehaves, and as the extension surface when
-# adding a pass or a backend.
+# adding a pass or an engine.
 #
 # Control-flow highlights:
 #
@@ -859,4 +864,4 @@ except ModuleNotFoundError:
 # - `analyze` guarantees that quantum operations do not depend on classical
 #   values derived from measurements
 # - Whether runtime branching survives into the circuit depends on the
-#   backend's `MeasurementMode` (`NATIVE` or `RUNNABLE` required)
+#   engine's `MeasurementMode` (`NATIVE` or `RUNNABLE` required)

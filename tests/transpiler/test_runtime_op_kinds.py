@@ -1,11 +1,11 @@
-"""Cell-by-cell coverage tests for ``RuntimeOpKind`` × Qiskit backend.
+"""Cell-by-cell coverage tests for ``RuntimeOpKind`` × Qiskit engine.
 
 The IR contract is that every variant of ``RuntimeOpKind`` reaches
 ``StandardEmitPass._emit_runtime_classical_expr`` and is dispatched to a
-backend-native runtime expression. Earlier this contract had a gap: the
-backend implemented every match arm but the frontend only emitted
+engine-native runtime expression. Earlier this contract had a gap: the
+engine implemented every match arm but the frontend only emitted
 AND/OR/NOT, so the comparison and arithmetic arms were dead code that
-hid the ``bool(...)`` coercion bug Copilot caught.
+hid an incorrect ``bool(...)`` coercion.
 
 These tests pin every cell:
 
@@ -16,7 +16,7 @@ These tests pin every cell:
 2. **Synthetic IR** for kinds the frontend cannot currently produce
    (``measure(QFixed) → Float`` participates here as the only numeric
    measurement path; Float arithmetic on tainted values is constructed
-   manually). This drives the Qiskit backend's ``expr.add``/``mul``/
+   manually). This drives the Qiskit engine's ``expr.add``/``mul``/
    ``equal``/``less``/... arms, exercising numeric preservation.
 
 3. **NotImplementedError** for kinds without a Qiskit equivalent
@@ -107,7 +107,7 @@ class TestFrontendReachableKinds:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: synthetic IR — drives every backend match arm directly
+# Layer 2: synthetic IR — drives every engine match arm directly
 # ---------------------------------------------------------------------------
 
 
@@ -180,7 +180,7 @@ class TestSyntheticBinaryExprDispatch:
             _materialize_binary(BinaryOperator[kind.name], lhs, rhs)
 
     def test_numeric_constants_preserve_their_type(self, expr_module):
-        """Regression for the Copilot-flagged ``bool(...)`` coercion bug.
+        """Keep numeric constants from being coerced to ``bool``.
 
         Building ``expr.equal(reg, 5)`` must keep ``5`` as an integer; if
         anything coerced operands to ``bool`` it would become ``True`` and
@@ -197,6 +197,31 @@ class TestSyntheticBinaryExprDispatch:
         assert result.op.name == "EQUAL"
         # Right operand should still represent 5, not True.
         assert getattr(result.right, "value", None) == 5
+
+    @pytest.mark.parametrize("operator_name", ["EQ", "NEQ"])
+    @pytest.mark.parametrize(
+        "bool_first", [True, False], ids=["bool-uint", "uint-bool"]
+    )
+    def test_mixed_bool_uint_equality_materializes_at_qiskit_boundary(
+        self,
+        operator_name: str,
+        bool_first: bool,
+        expr_module,
+    ) -> None:
+        """Qiskit expands mixed Bool and Uint equality only at materialization."""
+        from qamomile.circuit.transpiler.circuit_ir import BinaryOperator
+        from qamomile.qiskit.materializer import _materialize_binary
+
+        expr, types = expr_module
+        bit = expr.lift(True)
+        integer = expr.lift(2, types.Uint(8))
+        left, right = (bit, integer) if bool_first else (integer, bit)
+
+        result = _materialize_binary(BinaryOperator[operator_name], left, right)
+
+        assert isinstance(result.type, types.Bool)
+        expected_root = "LOGIC_OR" if operator_name == "EQ" else "LOGIC_NOT"
+        assert result.op.name == expected_root
 
 
 class TestSyntheticRuntimeClassicalExprConstruction:

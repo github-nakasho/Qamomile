@@ -2,7 +2,7 @@
 
 These tests cover the frontend behaviour (length, indexing, nesting,
 borrow tracking, error cases) and the end-to-end execution path on every
-supported quantum SDK backend for the canonical alternating-qubit
+supported quantum SDK engine for the canonical alternating-qubit
 pattern — the use case the slicing feature was introduced to support.
 """
 
@@ -19,9 +19,15 @@ import qamomile.observable as qm_o
 from qamomile.circuit.frontend.handle import VectorView
 from qamomile.circuit.frontend.qkernel_invocation import _wrap_array_result
 from qamomile.circuit.ir.block import Block
+from qamomile.circuit.ir.operation.control_flow import IfMerge
+from qamomile.circuit.ir.types.hamiltonian import ObservableType
 from qamomile.circuit.ir.types.primitives import QubitType, UIntType
 from qamomile.circuit.ir.value import ArrayValue, Value
-from qamomile.circuit.transpiler.errors import SliceBorrowViolationError
+from qamomile.circuit.transpiler.errors import (
+    QubitBorrowConflictError,
+    QubitConsumedError,
+    ValidationError,
+)
 from qamomile.circuit.transpiler.passes.slice_borrow_check import (
     SliceBorrowCheckPass,
     _SnapshotKind,
@@ -50,7 +56,7 @@ def _slice_array(
 ) -> ArrayValue:
     """Create a sliced ArrayValue for slice-borrow synthetic tests."""
     return ArrayValue(
-        type=QubitType(),
+        type=root.type,
         name=name,
         shape=(length,),
         slice_of=root,
@@ -60,12 +66,12 @@ def _slice_array(
 
 
 # ---------------------------------------------------------------------------
-# Frontend-only behavioural tests (no backend required)
+# Frontend-only behavioural tests (no engine required)
 # ---------------------------------------------------------------------------
 
 
 class TestVectorViewFrontend:
-    """Behaviour that should hold regardless of any backend being installed."""
+    """Behaviour that should hold regardless of any engine being installed."""
 
     def test_slice_returns_vector_view_with_block(self):
         """Slicing a Vector inside a qkernel produces a VectorView handle."""
@@ -245,7 +251,7 @@ class TestVectorViewFrontend:
 
 
 # ---------------------------------------------------------------------------
-# Cross-backend execution tests for the alternating-qubit pattern
+# Cross-engine execution tests for the alternating-qubit pattern
 # ---------------------------------------------------------------------------
 
 
@@ -256,11 +262,11 @@ class TestVectorViewFrontend:
         pytest.param("cudaq", marks=pytest.mark.cudaq),
     ]
 )
-def backend(request):
-    """Yield ``(transpiler, executor)`` for each installed backend.
+def engine(request):
+    """Yield ``(transpiler, executor)`` for each installed engine.
 
     Tests parametrized over this fixture run independently on each
-    backend and are skipped when the corresponding SDK is not
+    engine and are skipped when the corresponding SDK is not
     installed.
     """
     name = request.param
@@ -282,7 +288,7 @@ def backend(request):
 
         transpiler = CudaqTranspiler()
         return name, transpiler, transpiler.executor()
-    raise AssertionError(f"unknown backend {name}")
+    raise AssertionError(f"unknown engine {name}")
 
 
 # -- Sampling path ----------------------------------------------------------
@@ -290,15 +296,15 @@ def backend(request):
 
 @pytest.mark.parametrize("seed", [0, 1, 42])
 @pytest.mark.parametrize("n", [2, 3, 4, 5, 6, 7])
-def test_slice_even_hadamard_sampling(backend, seed, n):
-    """``q[0::2]`` + H hits exactly the even qubits across every backend.
+def test_slice_even_hadamard_sampling(engine, seed, n):
+    """``q[0::2]`` + H hits exactly the even qubits across every engine.
 
     Applies H on ``q[0::2]`` only, leaving the odd qubits in |0>.  After
     measurement every odd bit must be 0; the even bits are uniformly
     random.  Parametrized over register sizes and seeds so the assertion
     holds for varied shapes.
     """
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     rng = np.random.default_rng(seed)
     del rng  # reserved for future randomised variants; keep the plumbing
 
@@ -315,7 +321,7 @@ def test_slice_even_hadamard_sampling(backend, seed, n):
     job = exe.sample(executor, shots=1024)
     result = job.result()
 
-    # Normalise across backend result shapes: results is iterable of
+    # Normalise across engine result shapes: results is iterable of
     # (bits, count) where ``bits`` is a tuple of 0/1 in little-endian
     # kernel-order, matching the Vector indexing convention.
     total = 0
@@ -332,7 +338,7 @@ def test_slice_even_hadamard_sampling(backend, seed, n):
 
 @pytest.mark.parametrize("seed", [0, 1, 42])
 @pytest.mark.parametrize("n_pairs", [1, 2, 3])
-def test_slice_xy_brick_sampling(backend, seed, n_pairs):
+def test_slice_xy_brick_sampling(engine, seed, n_pairs):
     """Alternating CX on even/odd pairs produces perfect Bell-like pairs.
 
     This is the XY-mixer-style construction from the Alternating Operator
@@ -341,7 +347,7 @@ def test_slice_xy_brick_sampling(backend, seed, n_pairs):
     ``(|00> + |11>)/sqrt(2)``, so every measured outcome must have
     ``bits[2i] == bits[2i+1]`` — independent of the random seed.
     """
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     rng = np.random.default_rng(seed)
     del rng
 
@@ -382,7 +388,7 @@ def test_slice_xy_brick_sampling(backend, seed, n_pairs):
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 42])
 @pytest.mark.parametrize("n", [2, 3, 4])
-def test_slice_even_rx_expval(backend, seed, n):
+def test_slice_even_rx_expval(engine, seed, n):
     """``<Z_k>`` on an RX-even-only circuit matches ``cos(theta)`` or ``1``.
 
     Apply ``rx(theta)`` to ``q[0::2]``, leave odd qubits alone, then
@@ -391,13 +397,13 @@ def test_slice_even_rx_expval(backend, seed, n):
     Randomised over ``theta`` and varied over ``n`` and ``target`` so the
     test covers a spread of shapes.
     """
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     rng = np.random.default_rng(seed)
     theta = float(rng.uniform(-np.pi, np.pi))
 
     for target in range(n):
         expected = np.cos(theta) if target % 2 == 0 else 1.0
-        # Pad the observable to span the whole register so every backend's
+        # Pad the observable to span the whole register so every engine's
         # estimator sees a matching num_qubits.
         H = qm_o.Z(target) + 0.0 * qm_o.Z(n - 1)
 
@@ -775,6 +781,72 @@ class TestVectorViewAsKernelArgument:
         ]
         assert applied == [0, 2]
 
+    def test_runtime_if_full_reslice_return_stays_a_view(self):
+        """A conditional merge keeps a caller view's resource identity."""
+
+        @qmc.qkernel
+        def conditional_reslice(
+            q: qmc.Vector[qmc.Qubit],
+            flag: qmc.Bit,
+        ) -> qmc.Vector[qmc.Qubit]:
+            if flag:
+                q = qmc.x(q)
+            else:
+                q = qmc.h(q)
+            return q[:]
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Bit]:
+            q = qmc.qubit_array(4, "q")
+            middle = q[1:3]
+            middle = conditional_reslice(middle, flag)
+            q[1:3] = middle
+            return qmc.measure(q)
+
+        assert circuit.block is not None
+
+    @pytest.mark.parametrize("slice_in_true_branch", [False, True])
+    def test_runtime_if_direct_and_full_reslice_return_stays_a_view(
+        self,
+        slice_in_true_branch: bool,
+    ):
+        """Direct and full-slice branch forms share one array resource."""
+        if slice_in_true_branch:
+
+            @qmc.qkernel
+            def conditional_reslice(
+                q: qmc.Vector[qmc.Qubit],
+                flag: qmc.Bit,
+            ) -> qmc.Vector[qmc.Qubit]:
+                if flag:
+                    result = q[:]
+                else:
+                    result = q
+                return result[:]
+
+        else:
+
+            @qmc.qkernel
+            def conditional_reslice(
+                q: qmc.Vector[qmc.Qubit],
+                flag: qmc.Bit,
+            ) -> qmc.Vector[qmc.Qubit]:
+                if flag:
+                    result = q
+                else:
+                    result = q[:]
+                return result[:]
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Bit]:
+            q = qmc.qubit_array(4, "q")
+            middle = q[1:3]
+            middle = conditional_reslice(middle, flag)
+            q[1:3] = middle
+            return qmc.measure(q)
+
+        SliceBorrowCheckPass().run(circuit.block)
+
     def test_full_reslice_wrapper_keeps_caller_local_metadata(self):
         """A full re-slice keeps metadata remapped by call materialization."""
         length = _uint_value("length", 2)
@@ -1119,14 +1191,11 @@ class TestPostFoldLinearity:
         catches the aliasing immediately (``QubitBorrowConflictError``).
         When bounds stay symbolic — e.g. derived from an unbound
         parameter through arithmetic — ``SliceBorrowCheckPass``
-        resolves them post-fold and raises
-        ``SliceBorrowViolationError`` instead.
+        resolves them post-fold and raises the same
+        ``QubitBorrowConflictError``.
         """
         pytest.importorskip("qiskit")
-        from qamomile.circuit.transpiler.errors import (
-            QubitBorrowConflictError,
-            SliceBorrowViolationError,
-        )
+        from qamomile.circuit.transpiler.errors import QubitBorrowConflictError
         from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
@@ -1139,7 +1208,7 @@ class TestPostFoldLinearity:
             return qmc.measure(q)
 
         transpiler = QiskitTranspiler()
-        with pytest.raises((SliceBorrowViolationError, QubitBorrowConflictError)):
+        with pytest.raises(QubitBorrowConflictError):
             transpiler.transpile(circuit, bindings={"num": 4, "lo": 0, "hi": 4})
 
     def test_symbolic_slice_disjoint_from_direct_access_passes(self):
@@ -1198,10 +1267,7 @@ class TestPostFoldLinearity:
         slots are registered before any conflict check.
         """
         pytest.importorskip("qiskit")
-        from qamomile.circuit.transpiler.errors import (
-            QubitBorrowConflictError,
-            SliceBorrowViolationError,
-        )
+        from qamomile.circuit.transpiler.errors import QubitBorrowConflictError
         from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
@@ -1217,7 +1283,7 @@ class TestPostFoldLinearity:
             return qmc.measure(q)
 
         transpiler = QiskitTranspiler()
-        with pytest.raises((SliceBorrowViolationError, QubitBorrowConflictError)):
+        with pytest.raises(QubitBorrowConflictError):
             transpiler.transpile(circuit, bindings={"num": 4, "lo": 0, "hi": 4})
 
 
@@ -1300,6 +1366,589 @@ class TestSameSliceVersionRefresh:
         executable = QiskitTranspiler().transpile(circuit)
 
         assert executable.get_first_circuit().num_qubits == 3
+
+    def test_runtime_if_reconnects_branch_local_full_slices(self):
+        """Merged full slices return ownership to the merged root handle."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(4, "q")
+            if flag:
+                view = q[:]
+            else:
+                view = q[:]
+            view = qmc.h(view)
+            q[:] = view
+            return q
+
+        assert circuit.block is not None
+
+    @pytest.mark.parametrize("reslice_in_true_branch", [True, False])
+    def test_runtime_if_root_full_slice_merge_releases_alias_borrow(
+        self,
+        reslice_in_true_branch: bool,
+    ) -> None:
+        """A root/full-slice merge leaves the merged root directly usable."""
+
+        if reslice_in_true_branch:
+
+            @qmc.qkernel
+            def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+                q = qmc.qubit_array(4, "q")
+                if flag:
+                    q = q[:]
+                q[0] = qmc.h(q[0])
+                return q
+
+        else:
+
+            @qmc.qkernel
+            def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+                q = qmc.qubit_array(4, "q")
+                if flag:
+                    q = q
+                else:
+                    q = q[:]
+                q[0] = qmc.h(q[0])
+                return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_nested_runtime_if_root_full_slice_merge_releases_alias_borrow(self):
+        """Nested root/full-slice merges leave the outer merged root usable."""
+
+        @qmc.qkernel
+        def circuit(
+            outer_flag: qmc.Bit,
+            inner_flag: qmc.Bit,
+        ) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(4, "q")
+            if outer_flag:
+                if inner_flag:
+                    q = q[:]
+            q[1] = qmc.h(q[1])
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_root_full_slice_merge_preserves_prebranch_owner(self):
+        """Alias cleanup never retires a borrow live before the runtime If."""
+        checker = SliceBorrowCheckPass()
+        length = _uint_value("length", 4)
+        root = _qubit_array("q", length)
+        full_view = _slice_array(
+            root,
+            "full",
+            _uint_value("start", 0),
+            _uint_value("step", 1),
+            length,
+        )
+        merge = IfMerge(0, root, full_view, root.next_version())
+        key = (root.logical_id, "const:0")
+        state = {key: full_view}
+
+        assert checker._record_if_representation_alias(merge)
+        checker._retire_if_root_representation_borrows(
+            merge,
+            state,
+            dict(state),
+        )
+
+        assert state == {key: full_view}
+
+    @pytest.mark.parametrize(
+        ("start", "step", "view_length"),
+        [(0, 1, 3), (0, 2, 2), (3, -1, 4)],
+        ids=["partial", "strided", "reordered"],
+    )
+    def test_root_non_full_slice_merge_is_not_representation_alias(
+        self,
+        start: int,
+        step: int,
+        view_length: int,
+    ) -> None:
+        """Partial, strided, and reordered slices remain distinct resources."""
+        checker = SliceBorrowCheckPass()
+        length = _uint_value("length", 4)
+        root = _qubit_array("q", length)
+        view = _slice_array(
+            root,
+            "view",
+            _uint_value("start", start),
+            _uint_value("step", step),
+            _uint_value("view_length", view_length),
+        )
+        merge = IfMerge(0, root, view, root.next_version())
+
+        assert not checker._record_if_representation_alias(merge)
+
+    def test_malformed_reslice_merge_is_not_representation_alias(self) -> None:
+        """Malformed non-vector metadata is rejected without indexing shape."""
+        checker = SliceBorrowCheckPass()
+        length = _uint_value("length", 4)
+        root = _qubit_array("q", length)
+        malformed = dataclasses.replace(
+            _slice_array(
+                root,
+                "malformed",
+                _uint_value("start", 0),
+                _uint_value("step", 1),
+                length,
+            ),
+            shape=(),
+        )
+        merge = IfMerge(0, root, malformed, root.next_version())
+
+        assert not checker._record_if_representation_alias(merge)
+
+    def test_unhashable_type_full_slice_merge_is_representation_alias(self) -> None:
+        """Resource equality never requires an IR element type to be hashable."""
+        checker = SliceBorrowCheckPass()
+        length = _uint_value("length", 4)
+        root = ArrayValue(
+            type=ObservableType(),
+            name="observables",
+            shape=(length,),
+        )
+        full_view = _slice_array(
+            root,
+            "full",
+            _uint_value("start", 0),
+            _uint_value("step", 1),
+            length,
+        )
+        merge = IfMerge(0, root, full_view, root.next_version())
+
+        assert checker._record_if_representation_alias(merge)
+
+    def test_runtime_if_reslices_existing_partial_view(self):
+        """A branch-local full reslice retains the pre-branch borrow owner."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(4, "q")
+            view = q[1:3]
+            if flag:
+                view = view[:]
+            else:
+                view = view
+            view = qmc.h(view)
+            q[1:3] = view
+            return q
+
+        assert circuit.block is not None
+
+    @pytest.mark.parametrize("reslice_in_true_branch", [True, False])
+    def test_runtime_if_reconnects_nested_prebranch_view(
+        self,
+        reslice_in_true_branch: bool,
+    ):
+        """A one-sided reslice keeps its nested pre-branch view lineage."""
+
+        if reslice_in_true_branch:
+
+            @qmc.qkernel
+            def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+                q = qmc.qubit_array(6, "q")
+                outer = q[0::2]
+                view = outer[1:3]
+                if flag:
+                    view = view[:]
+                else:
+                    view = view
+                view = qmc.h(view)
+                outer[1:3] = view
+                q[0::2] = outer
+                return q
+
+        else:
+
+            @qmc.qkernel
+            def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+                q = qmc.qubit_array(6, "q")
+                outer = q[0::2]
+                view = outer[1:3]
+                if flag:
+                    view = view
+                else:
+                    view = view[:]
+                view = qmc.h(view)
+                outer[1:3] = view
+                q[0::2] = outer
+                return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_runtime_if_reconnects_two_resliced_nested_prebranch_views(self):
+        """Two-sided reslices keep their nested pre-branch view lineage."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            if flag:
+                view = view[:]
+            else:
+                view = view[:]
+            view = qmc.h(view)
+            outer[1:3] = view
+            q[0::2] = outer
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_nested_runtime_if_reconnects_nested_prebranch_view(self):
+        """Nested If merges preserve the canonical outer-view lineage."""
+
+        @qmc.qkernel
+        def circuit(
+            outer_flag: qmc.Bit,
+            inner_flag: qmc.Bit,
+        ) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            if outer_flag:
+                if inner_flag:
+                    view = view[:]
+                else:
+                    view = view
+            else:
+                view = view
+            view = qmc.h(view)
+            outer[1:3] = view
+            q[0::2] = outer
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_runtime_if_multiple_full_reslices_preserve_one_lineage(self):
+        """Repeated full reslices remain one resource across an If merge."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(4, "q")
+            view = q[1:3]
+            if flag:
+                view = view[:][:]
+            else:
+                view = view
+            view[0] = qmc.h(view[0])
+            q[1:3] = view
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_runtime_if_two_full_reslices_preserve_one_lineage(self):
+        """Both branches may refresh one pre-branch view independently."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(4, "q")
+            view = q[1:3]
+            if flag:
+                view = view[:]
+            else:
+                view = view[:]
+            view[0] = qmc.h(view[0])
+            q[1:3] = view
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_runtime_if_reslices_symbolic_partial_view(self):
+        """Full-reslice recognition does not require concrete coverage."""
+
+        @qmc.qkernel
+        def circuit(
+            n: qmc.UInt,
+            flag: qmc.Bit,
+        ) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(n, "q")
+            view = q[1:n]
+            if flag:
+                view = view[:]
+            else:
+                view = view
+            view = qmc.h(view)
+            q[1:n] = view
+            return q
+
+        assert circuit.block is not None
+
+    def test_runtime_if_reconnects_hidden_view_parent(self):
+        """A merged view remains usable when its root is not an If output."""
+
+        @qmc.qkernel
+        def circuit(
+            q: qmc.Vector[qmc.Qubit],
+            flag: qmc.Bit,
+        ) -> qmc.Vector[qmc.Qubit]:
+            view = q[1:3]
+            if flag:
+                view[0] = qmc.x(view[0])
+            else:
+                view[0] = qmc.z(view[0])
+            view[1] = qmc.h(view[1])
+            return view
+
+        assert circuit.block is not None
+
+    def test_runtime_if_reconnects_borrowed_element_parent(self):
+        """A scalar element merge can be returned to its merged array."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(2, "q")
+            element = q[0]
+            if flag:
+                element = qmc.x(element)
+            else:
+                element = qmc.h(element)
+            q[0] = element
+            return q
+
+        assert circuit.block is not None
+
+    def test_runtime_if_reconnects_pass_through_element_parent(self):
+        """An unchanged element keeps the array selected by a sibling merge."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(2, "q")
+            element = q[0]
+            alias = element
+            if flag:
+                q[1] = qmc.x(q[1])
+            else:
+                q[1] = qmc.h(q[1])
+            element = qmc.x(element)
+            q[0] = element
+            _ = alias
+            return q
+
+        assert circuit.block is not None
+
+    def test_runtime_if_reconnects_aliased_pass_through_element_parent(self):
+        """An unused Python alias does not detach a live element from its parent."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(2, "q")
+            element = q[0]
+            _alias = element
+            if flag:
+                q[1] = qmc.x(q[1])
+            else:
+                q[1] = qmc.h(q[1])
+            element = qmc.x(element)
+            q[0] = element
+            return q
+
+        assert circuit.block is not None
+
+    def test_runtime_if_reconnects_nested_pass_through_element_parent(self):
+        """A nested element and view follow a merged root-array parent."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            element = outer[0]
+            if flag:
+                q[1] = qmc.x(q[1])
+            else:
+                q[1] = qmc.h(q[1])
+            element = qmc.x(element)
+            outer[0] = element
+            q[0::2] = outer
+            return q
+
+        assert circuit.block is not None
+
+    def test_runtime_if_keeps_live_prebranch_element_borrow(self):
+        """A live element still blocks a second borrow after an array merge."""
+        from qamomile.circuit.transpiler.errors import QubitBorrowConflictError
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            element = q[0]
+            if flag:
+                q[1] = qmc.x(q[1])
+            else:
+                q[1] = qmc.h(q[1])
+            duplicate = q[0]
+            duplicate = qmc.z(duplicate)
+            return qmc.measure(element)
+
+        with pytest.raises(QubitBorrowConflictError, match="already borrowed"):
+            _ = circuit.block
+
+    def test_runtime_if_keeps_live_element_borrow_inside_branch(self):
+        """A captured element blocks a second borrow while tracing a branch."""
+        from qamomile.circuit.transpiler.errors import QubitBorrowConflictError
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            element = q[0]
+            if flag:
+                q[0] = qmc.x(q[0])
+            return qmc.measure(element)
+
+        with pytest.raises(QubitBorrowConflictError, match="already borrowed"):
+            _ = circuit.block
+
+    def test_runtime_if_preserves_destroyed_condition_slot_for_sibling_use(self):
+        """A measured condition slot does not block a disjoint sibling slot."""
+
+        @qmc.qkernel
+        def circuit() -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            q[0] = qmc.h(q[0])
+            flag = qmc.measure(q[0])
+            if flag:
+                q[1] = qmc.x(q[1])
+            return qmc.measure(q[1])
+
+        assert circuit.block is not None
+
+    def test_direct_element_measure_marks_parent_slot_destroyed(self):
+        """A direct element measurement prevents later whole-array reuse."""
+        from qamomile.circuit.transpiler.errors import QubitConsumedError
+
+        @qmc.qkernel
+        def circuit() -> qmc.Vector[qmc.Bit]:
+            q = qmc.qubit_array(2, "q")
+            _ = qmc.measure(q[0])
+            return qmc.measure(q)
+
+        with pytest.raises(QubitConsumedError, match="already destroyed"):
+            _ = circuit.block
+
+    def test_runtime_if_rejects_destroyed_condition_slot_inside_branch(self):
+        """A measured temporary element cannot be re-borrowed in a branch."""
+        from qamomile.circuit.transpiler.errors import QubitConsumedError
+
+        @qmc.qkernel
+        def circuit() -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            flag = qmc.measure(q[0])
+            if flag:
+                q[0] = qmc.x(q[0])
+            else:
+                q[1] = qmc.h(q[1])
+            return qmc.measure(q[1])
+
+        with pytest.raises(QubitConsumedError, match="already consumed"):
+            _ = circuit.block
+
+    def test_runtime_if_rejects_destroyed_condition_slot_after_merge(self):
+        """A measured temporary element remains destroyed after an If merge."""
+        from qamomile.circuit.transpiler.errors import QubitConsumedError
+
+        @qmc.qkernel
+        def circuit() -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            flag = qmc.measure(q[0])
+            if flag:
+                q[1] = qmc.x(q[1])
+            else:
+                q[1] = qmc.h(q[1])
+            q[0] = qmc.z(q[0])
+            return qmc.measure(q[1])
+
+        with pytest.raises(QubitConsumedError, match="already consumed"):
+            _ = circuit.block
+
+    def test_runtime_if_keeps_dead_name_direct_element_borrow(self):
+        """A borrow remains active even when its Python name is dead at the If."""
+        from qamomile.circuit.transpiler.errors import QubitBorrowConflictError
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            _element = q[0]
+            if flag:
+                q[1] = qmc.x(q[1])
+            else:
+                q[1] = qmc.h(q[1])
+            q[0] = qmc.z(q[0])
+            return qmc.measure(q[1])
+
+        with pytest.raises(QubitBorrowConflictError, match="already borrowed"):
+            _ = circuit.block
+
+    def test_runtime_if_does_not_revive_named_consumed_element(self):
+        """A captured consumed element remains unusable inside either branch."""
+        from qamomile.circuit.transpiler.errors import QubitConsumedError
+
+        @qmc.qkernel
+        def circuit() -> qmc.Bit:
+            q = qmc.qubit_array(2, "q")
+            element = q[0]
+            flag = qmc.measure(element)
+            if flag:
+                element = qmc.x(element)
+            else:
+                element = qmc.z(element)
+            return qmc.measure(element)
+
+        with pytest.raises(QubitConsumedError, match="already consumed"):
+            _ = circuit.block
+
+    def test_runtime_if_reconnects_branch_local_element_borrows(self):
+        """Equal literal indices from separate branches share one owner."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(2, "q")
+            if flag:
+                element = q[0]
+                element = qmc.x(element)
+            else:
+                element = q[0]
+                element = qmc.h(element)
+            q[0] = element
+            return q
+
+        assert circuit.block is not None
+
+    def test_runtime_if_does_not_unify_different_element_borrows(self):
+        """Different branch-local indices cannot acquire one merged owner."""
+        from qamomile.circuit.transpiler.errors import AffineTypeError
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(2, "q")
+            if flag:
+                element = q[0]
+            else:
+                element = q[1]
+            q[0] = element
+            return q
+
+        with pytest.raises(AffineTypeError, match="same index"):
+            _ = circuit.block
+
+    def test_runtime_if_merge_version_is_newer_than_branch_views(self):
+        """A slice merge cannot move its logical resource version backward."""
+
+        @qmc.qkernel
+        def circuit(flag: qmc.Bit) -> qmc.Vector[qmc.Bit]:
+            q = qmc.qubit_array(4, "q")
+            view = q[1:3]
+            if flag:
+                view = qmc.qft(view)
+            else:
+                view = qmc.iqft(view)
+            view[0] = qmc.h(view[0])
+            q[1:3] = view
+            return qmc.measure(q)
+
+        SliceBorrowCheckPass().run(circuit.block)
 
     def test_zero_trip_loop_does_not_trace_destructive_slice_body(self):
         """Literal zero-trip loops do not leak skipped destructive slice use."""
@@ -1390,6 +2039,125 @@ class TestSameSliceVersionRefresh:
 
         assert executable.get_first_circuit().num_qubits == 4
 
+    def test_static_loop_reslice_of_nested_preloop_view_transpiles(self):
+        """A loop full-reslice returns directly to the pre-loop outer view."""
+        pytest.importorskip("qiskit")
+        from qamomile.qiskit import QiskitTranspiler
+
+        @qmc.qkernel
+        def circuit() -> qmc.Vector[qmc.Bit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            for _ in qmc.range(1):
+                view = view[:]
+            view[0] = qmc.h(view[0])
+            outer[1:3] = view
+            q[0::2] = outer
+            return qmc.measure(q)
+
+        executable = QiskitTranspiler().transpile(circuit)
+
+        assert executable.get_first_circuit().num_qubits == 6
+
+    def test_symbolic_loop_reslice_of_nested_preloop_view_is_one_lineage(self):
+        """A potentially zero-trip For keeps an exact reslice as one resource."""
+
+        @qmc.qkernel
+        def circuit(repetitions: qmc.UInt) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            for _ in qmc.range(repetitions):
+                view = view[:]
+            view[0] = qmc.h(view[0])
+            outer[1:3] = view
+            q[0::2] = outer
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_zero_trip_loop_keeps_nested_preloop_view(self):
+        """A skipped loop leaves the original nested-view return path intact."""
+
+        @qmc.qkernel
+        def circuit() -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            for _ in qmc.range(0):
+                view = view[:]
+            view[0] = qmc.h(view[0])
+            outer[1:3] = view
+            q[0::2] = outer
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_while_reslice_of_nested_preloop_view_is_one_lineage(self):
+        """A measurement-backed While preserves an exact view reslice."""
+        pytest.importorskip("qiskit")
+        from qamomile.qiskit import QiskitTranspiler
+
+        @qmc.qkernel
+        def circuit() -> qmc.Bit:
+            q = qmc.qubit_array(7, "q")
+            outer = q[0:4]
+            view = outer[1:3]
+            condition = qmc.measure(q[6])
+            while condition:
+                view = view[:]
+                condition = qmc.measure(q[5])
+            view[0] = qmc.h(view[0])
+            outer[1:3] = view
+            q[0:4] = outer
+            return condition
+
+        executable = QiskitTranspiler().transpile(circuit)
+
+        assert executable.get_first_circuit().num_qubits == 7
+
+    def test_nested_if_and_loop_reslice_preserves_preloop_outer(self):
+        """Nested control flow cannot add a phantom full-reslice layer."""
+
+        @qmc.qkernel
+        def circuit(
+            repetitions: qmc.UInt,
+            flag: qmc.Bit,
+        ) -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            for _ in qmc.range(repetitions):
+                if flag:
+                    view = view[:]
+                else:
+                    view = view
+            view[0] = qmc.h(view[0])
+            outer[1:3] = view
+            q[0::2] = outer
+            return q
+
+        SliceBorrowCheckPass().run(circuit.block)
+
+    def test_loop_partial_reslice_cannot_skip_immediate_outer(self):
+        """Loop normalization does not treat a partial slice as an alias."""
+        from qamomile.circuit.transpiler.errors import AffineTypeError
+
+        @qmc.qkernel
+        def circuit() -> qmc.Vector[qmc.Qubit]:
+            q = qmc.qubit_array(6, "q")
+            outer = q[0::2]
+            view = outer[1:3]
+            for _ in qmc.range(1):
+                view = view[0:1]
+            outer[1:3] = view
+            q[0::2] = outer
+            return q
+
+        with pytest.raises(AffineTypeError, match="immediate outer view"):
+            _ = circuit.block
+
     def test_skipped_outer_view_is_consumed_after_full_slice_handoff(self):
         """Direct root return retires the skipped outer view."""
         from qamomile.circuit.transpiler.errors import QubitConsumedError
@@ -1439,9 +2207,10 @@ class TestSameSliceVersionRefresh:
         with pytest.raises(AffineTypeError, match="immediate outer view"):
             _ = circuit.block
 
-    def test_runtime_if_nested_full_slice_handoff_stays_rejected(self):
-        """Branch-dependent nested full-slice handoff stays unsafe."""
-        from qamomile.circuit.transpiler.errors import QubitBorrowConflictError
+    def test_runtime_if_nested_full_slice_handoff_transpiles(self):
+        """A branch-local full reslice denotes the same physical slots."""
+        pytest.importorskip("qiskit")
+        from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
         def circuit() -> qmc.Vector[qmc.Bit]:
@@ -1454,8 +2223,9 @@ class TestSameSliceVersionRefresh:
             q[0::2] = evens
             return qmc.measure(q[:3])
 
-        with pytest.raises(QubitBorrowConflictError):
-            _ = circuit.block
+        executable = QiskitTranspiler().transpile(circuit)
+
+        assert executable.get_first_circuit().num_qubits == 4
 
     def test_huge_static_loop_bound_does_not_overflow_trace_guard(self):
         """Static loop trace guard handles ranges larger than ssize_t."""
@@ -1502,7 +2272,7 @@ class TestSameSliceVersionRefresh:
         checker._register_slice_bulk_borrow_if_new(stale, state)
         checker._register_slice_bulk_borrow_if_new(current, state)
 
-        with pytest.raises(SliceBorrowViolationError, match="forward SSA-version"):
+        with pytest.raises(QubitConsumedError, match="forward SSA-version"):
             checker._register_slice_bulk_borrow_if_new(stale, state)
 
     def test_symbolic_exact_descriptor_forward_refresh_is_allowed(self):
@@ -1536,7 +2306,7 @@ class TestSameSliceVersionRefresh:
 
         checker._register_slice_bulk_borrow_if_new(owner, state)
 
-        with pytest.raises(SliceBorrowViolationError, match="may overlap"):
+        with pytest.raises(QubitBorrowConflictError, match="may overlap"):
             checker._register_slice_bulk_borrow_if_new(changed, state)
 
     def test_symbolic_adjacent_prefix_suffix_descriptors_are_allowed(self):
@@ -1616,7 +2386,7 @@ class TestSameSliceVersionRefresh:
 
         checker._register_slice_bulk_borrow_if_new(evens, state)
 
-        with pytest.raises(SliceBorrowViolationError, match="may overlap"):
+        with pytest.raises(QubitBorrowConflictError, match="may overlap"):
             checker._register_slice_bulk_borrow_if_new(odds, state)
 
     def test_symbolic_recomputed_descriptor_is_rejected(self):
@@ -1632,7 +2402,7 @@ class TestSameSliceVersionRefresh:
 
         checker._register_slice_bulk_borrow_if_new(owner, state)
 
-        with pytest.raises(SliceBorrowViolationError, match="not a forward"):
+        with pytest.raises(QubitBorrowConflictError, match="not a forward"):
             checker._register_slice_bulk_borrow_if_new(recomputed, state)
 
     def test_symbolic_refresh_inside_unsafe_snapshot_is_rejected(self):
@@ -1651,7 +2421,7 @@ class TestSameSliceVersionRefresh:
             (_SnapshotKind.UNSAFE_CONTROL_BODY, dict(state))
         )
         try:
-            with pytest.raises(SliceBorrowViolationError, match="may be skipped"):
+            with pytest.raises(ValidationError, match="may be skipped"):
                 checker._register_slice_bulk_borrow_if_new(refreshed, state)
         finally:
             checker._outer_snapshot_stack.pop()
@@ -2005,7 +2775,7 @@ class TestWholeViewEmit:
         assert qc.num_qubits == 4
 
         # The controlled gate should touch exactly physical qubits {1, 3}.
-        # Names are backend-dependent (``ccircuit-N`` etc.); filter by
+        # Names are engine-dependent (``ccircuit-N`` etc.); filter by
         # non-measure and expect 2-qubit instruction spanning {1, 3}.
         controlled_qubits: set[int] = set()
         for inst in qc.data:
@@ -2026,7 +2796,7 @@ class TestWholeViewEmit:
         ``qubit_map`` is empty, ``remap_qubits`` returns ``self``
         verbatim, so the user's ``H`` got poisoned to the first
         circuit's width and subsequent runs with smaller circuits
-        crashed inside the backend estimator.  The fix clones the
+        crashed inside the engine estimator.  The fix clones the
         Hamiltonian before padding ``_num_qubits``.
         """
         pytest.importorskip("qiskit")
@@ -2095,22 +2865,16 @@ class TestWholeViewEmit:
         )
 
 
-class TestRound2Reviewer:
-    """Regression tests for the 2nd-round adversarial review findings.
+class TestSliceSafety:
+    """Cover slice bounds, ownership, lowering, snapshots, and step validation."""
 
-    Covers P1-A (OOB slice clamp), P1-B (destructive view consume),
-    P1-C (if-lowering merge substitution on SliceArrayOp result),
-    P2-A (frontend/post-fold drain alignment), P2-B (H snapshot),
-    P2-C (UInt const negative/zero validation).
-    """
-
-    # ----- P1-A -------------------------------------------------------------
+    # ----- Slice-bound clamping ---------------------------------------------
 
     def test_slice_stop_beyond_parent_is_clamped(self):
         """``q[3:10]`` on a 4-qubit register produces a length-1 view.
 
-        Regression (P1-A): without clamping, emit produced a 7-clbit
-        result with only one measurement — silent data loss.
+        Without clamping, emit would produce a 7-clbit result with only
+        one measurement, causing silent data loss.
         """
         pytest.importorskip("qiskit")
         from qamomile.qiskit import QiskitTranspiler
@@ -2130,19 +2894,15 @@ class TestRound2Reviewer:
         n_meas = sum(1 for inst in qc.data if inst.operation.name == "measure")
         assert n_meas == 1
 
-    # ----- P1-B -------------------------------------------------------------
+    # ----- Destructive view consumption ------------------------------------
 
     def test_measure_view_then_measure_parent_rejects(self):
         """``measure(q[1::2]); measure(q)`` must error — q[1], q[3] destroyed.
 
-        Regression (P1-B): frontend previously released only the view
-        slice-borrow and left the parent re-consumable, allowing a
-        second measure to silently re-measure collapsed qubits.
+        The frontend must preserve the destroyed parent slots after releasing
+        the view borrow so a second measurement cannot reuse collapsed qubits.
         """
-        from qamomile.circuit.transpiler.errors import (
-            QubitConsumedError,
-            SliceBorrowViolationError,
-        )
+        from qamomile.circuit.transpiler.errors import QubitConsumedError
 
         @qmc.qkernel
         def kern() -> qmc.Vector[qmc.Bit]:
@@ -2151,7 +2911,7 @@ class TestRound2Reviewer:
             _ = qmc.measure(odd)
             return qmc.measure(q)
 
-        with pytest.raises((QubitConsumedError, SliceBorrowViolationError)):
+        with pytest.raises(QubitConsumedError):
             kern.block
 
     def test_element_access_after_view_measure_rejects(self):
@@ -2191,13 +2951,13 @@ class TestRound2Reviewer:
         assert qc.num_qubits == 4
         assert qc.num_clbits == 4
 
-    # ----- P1-C -------------------------------------------------------------
+    # ----- Slice-result substitution ---------------------------------------
 
     def test_if_lowering_substitutes_slice_array_op_results(self):
         """``_apply_substitution`` now walks SliceArrayOp result metadata.
 
-        Regression (P1-C): for an ``if`` whose branches flow into a
-        slice's bounds, the merge-output references must be substituted
+        For an ``if`` whose branches flow into a slice's bounds, the
+        merge-output references must be substituted
         into ``SliceArrayOperation.results[0].slice_start`` /
         ``slice_step`` — not just operands — so post-fold coverage
         registration sees the concrete bounds.  Directly exercising
@@ -2236,7 +2996,7 @@ class TestRound2Reviewer:
         assert isinstance(result_av, ArrayValue)
         assert result_av.slice_start is folded_start
 
-    # ----- P2-A -------------------------------------------------------------
+    # ----- Overlapping-view validation -------------------------------------
 
     def test_overlapping_top_level_views_are_rejected(self):
         """Top-level same-range / overlapping views are rejected at trace time.
@@ -2268,14 +3028,14 @@ class TestRound2Reviewer:
         ):
             _ = kern.block
 
-    # ----- P2-B -------------------------------------------------------------
+    # ----- Observable-binding snapshots -----------------------------------
 
     def test_expval_snapshots_hamiltonian_binding(self):
         """Post-transpile mutations of ``H`` do not leak into ``exe.run``.
 
-        Regression (P2-B): the compiled executable held the binding
-        by reference, so ``H.add_term(...)`` between transpile and
-        run silently altered the evaluated observable.
+        The compiled executable must not hold the binding by reference;
+        otherwise ``H.add_term(...)`` between transpile and run would
+        silently alter the evaluated observable.
         """
         pytest.importorskip("qiskit")
         from qamomile.qiskit import QiskitTranspiler
@@ -2298,14 +3058,13 @@ class TestRound2Reviewer:
             f"exe.run picked up post-transpile H mutation; got {value}"
         )
 
-    # ----- P2-C -------------------------------------------------------------
+    # ----- Constant slice-step validation ---------------------------------
 
     def test_zero_uint_const_step_rejected(self):
         """``q[0:4:UInt(0)]`` raises ``NotImplementedError`` before arithmetic.
 
-        Regression (P2-C): the previous ``int``-only validation let a
-        ``UInt`` handle with const 0 through; ``_compute_slice_length``
-        then hit ``ZeroDivisionError`` inside arithmetic.
+        Validation must also reject a ``UInt`` handle with const 0 before
+        ``_compute_slice_length`` reaches a division by zero.
         """
         from qamomile.circuit.frontend.handle.primitives import UInt
         from qamomile.circuit.ir.types.primitives import UIntType
@@ -2326,31 +3085,19 @@ class TestRound2Reviewer:
             kern.block
 
 
-class TestRound3Reviewer:
-    """Regression tests for Codex Round 3 adversarial review findings.
+class TestMeasurementResultShapeFolding:
+    """Verify bound-derived measurement shapes are folded before allocation."""
 
-    Covers R3-A: constant-fold does not fold result ArrayValues for
-    non-SliceArrayOp ops (``MeasureVectorOperation`` clbit-result
-    shape stays symbolic → allocator emits 0 clbits).
-
-    The accompanying R3-B regressions (``measure(q[1::2])`` then
-    ``expval(q, ...)`` over the same register and friends) used to
-    live here as well; they have moved to
-    ``tests/circuit/test_expval.py::TestExpvalOverConsumedSlots``
-    alongside the other expval-consume guarantees.
-    """
-
-    # ----- R3-A: constant-fold must fold operation *results* ----------------
+    # ----- Fold operation results before allocation ------------------------
 
     def test_binop_derived_slice_bounds_emit_correct_clbit_count(self):
         """``measure(q[lo+0 : hi+0])`` folds to concrete clbits via bound bindings.
 
-        Regression (R3-A): ``_substitute_folded_operands`` only folded
-        ``op.operands``, not ``op.results``.  The ``MeasureVectorOperation``
-        clbit-result array carries a ``shape`` derived from the BinOp
-        ``(hi+0) - (lo+0)``; without result folding the shape remained
-        symbolic and the allocator produced zero clbits — a silent data
-        loss identical to the earlier OOB clamp bug.
+        ``_substitute_folded_operands`` must fold ``op.results`` as well as
+        ``op.operands``. The ``MeasureVectorOperation`` clbit-result array
+        carries a ``shape`` derived from the BinOp ``(hi+0) - (lo+0)``;
+        without result folding the shape remains symbolic and the allocator
+        produces zero clbits.
         """
         pytest.importorskip("qiskit")
         from qamomile.qiskit import QiskitTranspiler
@@ -2405,15 +3152,12 @@ class TestRound3Reviewer:
         assert qc.num_clbits == 3
 
 
-class TestRound4Reviewer:
-    """Regression tests for Codex Round 4 adversarial review findings.
+class TestDerivedSliceBehavior:
+    """Verify clamping, ownership, carrier resolution, and derived-bound folding.
 
-    R4-A: BinOp-derived view stop bound is not clamped to the parent
-    length, so ``measure(q[0:hi+0])`` with ``hi`` greater than the parent
-    length over-reports clbits and silently drops measurements.  The fix
-    routes the clamp through a new :attr:`BinOpKind.MIN` so the same
-    construction handles eager folding (literal bounds) and deferred
-    folding (parameter-derived bounds).
+    BinOp-derived view bounds must clamp to the parent length before
+    allocation. The same construction handles eager folding for literal
+    bounds and deferred folding for parameter-derived bounds.
     """
 
     def test_binop_stop_clamped_to_parent_length_from_zero(self):
@@ -2497,7 +3241,7 @@ class TestRound4Reviewer:
         qc = exe.compiled_quantum[0].circuit
         assert qc.num_clbits == 4
 
-    # ----- R4-B: separately-derived view consumed-slot check ----------------
+    # ----- Consumed slots across separately derived views ------------------
 
     def test_two_same_range_views_with_destructive_consume_rejected(self):
         """``odd1=q[1::2]; odd2=q[1::2]; measure(odd1); expval(odd2,obs)`` is rejected."""
@@ -2523,7 +3267,7 @@ class TestRound4Reviewer:
             q = qmc.qubit_array(4, "q")
             # Sequential same-range slicing triggers the opportunistic
             # drain that transfers parent-slot ownership from view1 to
-            # view2 — the underlying R4-B bug pattern.
+            # view2, exercising same-range ownership transfer.
             view1 = q[0::2]
             view2 = q[0::2]
             _ = qmc.measure(view1)
@@ -2584,7 +3328,7 @@ class TestRound4Reviewer:
         """``measure(q[1::2])`` then ``q[1::2]`` again surfaces as
         ``QubitConsumedError``, not the live-borrow conflict.
 
-        The earlier Round-4 tests pin the LIVE-overlap variant: ``v1 =
+        The live-overlap tests above cover the variant where ``v1 =
         q[1::2]; v2 = q[1::2]`` rejects ``v2``'s construction before
         any destructive consume happens (``QubitBorrowConflictError``).
         This test pins the *post-destructive-consume* recreation path:
@@ -2607,7 +3351,7 @@ class TestRound4Reviewer:
         with pytest.raises(QubitConsumedError, match="already destroyed"):
             kern.block
 
-    # ----- R4-C: cast(view, ...) carrier-key root-space resolution -----------
+    # ----- Root-space carrier resolution for cast views --------------------
 
     def test_cast_view_to_qfixed_measures_root_qubits(self):
         """``cast(q[1::2], QFixed)`` measures the root qubits the view covers."""
@@ -2628,7 +3372,7 @@ class TestRound4Reviewer:
         # The view covers q[1], q[3], q[5], q[7] — four physical qubits.
         assert n_meas == 4, (
             f"cast(q[1::2], QFixed) followed by measure must emit 4 "
-            f"measurements; got {n_meas} (R4-C carrier-key bug)"
+            f"measurements; got {n_meas} (view carrier-resolution regression)"
         )
         # Verify the measured qubits are the root-space {1, 3, 5, 7}.
         measured_q = sorted(
@@ -2700,7 +3444,7 @@ class TestRound4Reviewer:
         with pytest.raises(ValueError, match="symbolic"):
             kern.block
 
-    # ----- R4-D: eager BinOp folding when both operands are constants --------
+    # ----- Eager BinOp folding for constant operands -----------------------
 
     def test_binop_with_two_constants_folds_eagerly_at_trace(self):
         """``UInt(const) + 0`` collapses to a constant Value at trace, no BinOp."""
@@ -2826,47 +3570,36 @@ class TestRound4Reviewer:
         assert measured_q == [2, 3, 4]
 
 
-class TestRound5Reviewer:
-    """Regression tests for Copilot Round 5 review findings.
+class TestSliceBorrowState:
+    """Verify slice-borrow state is isolated and survives loop merges.
 
-    Covers three additional silent-fail / cross-contamination bugs the
-    earlier rounds missed:
-
-    R5-A: ``_build_qubit_map`` swallows ``EmitError`` from
-    ``resolve_slice_chain`` for sliced operands and falls back to the
-    element_uuid path, producing an empty qubit_map and a far-away
-    backend width-mismatch error.
-    R5-B: ``SliceBorrowCheckPass`` borrow-state keyed only by
-    slot index aliases independent registers — consuming ``a[1]``
-    spuriously blocks ``b[1]``.
-    R5-C: The loop-body state merge inside ``_walk_nested`` only
-    propagates *new* keys back to the outer state, dropping
-    consumed-slot markers installed inside the loop and view
-    ownership transitions for views created before the loop.
+    Borrow-state keys must include the root register so equal slot indices in
+    independent registers do not alias. Loop-body merges must propagate
+    consumed-slot markers and ownership transitions back to the outer state.
     """
 
-    # ----- R5-B: borrow keys must be namespaced per root array --------------
+    # ----- Borrow keys namespaced per root array ---------------------------
 
     def test_consume_view_on_one_register_does_not_block_other_register(self):
-        """``measure(a[1::2]); expval(b, Z(1))`` over disjoint registers must succeed."""
+        """Consuming a view on ``a`` must not block access to register ``b``."""
         pytest.importorskip("qiskit")
         from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
-        def kern(obs: qmc.Observable) -> qmc.Float:
+        def kern() -> qmc.Vector[qmc.Bit]:
             a = qmc.qubit_array(4, "a")
             b = qmc.qubit_array(4, "b")
             _ = qmc.measure(a[1::2])
             # b's slot 1 must remain accessible — the consumed-slot
             # markers from a's destructive view must not bleed into b.
-            return qmc.expval(b, obs)
+            b[1] = qmc.x(b[1])
+            return qmc.measure(b)
 
-        H = qm_o.Z(1)
         transpiler = QiskitTranspiler()
         # If borrow keys were not namespaced, this would raise
-        # SliceBorrowViolationError or a stage-later EmitError; we
+        # QubitConsumedError or a stage-later EmitError; we
         # only need the kernel to trace and transpile cleanly.
-        exe = transpiler.transpile(kern, bindings={"obs": H})
+        exe = transpiler.transpile(kern)
         assert exe is not None
 
     def test_disjoint_registers_can_each_consume_view_independently(self):
@@ -2887,14 +3620,11 @@ class TestRound5Reviewer:
         # Both views measure 2 qubits each on their own register.
         assert qc.num_clbits >= 2
 
-    # ----- R5-C: loop-body state must propagate consumed markers -------------
+    # ----- Loop-body state propagates consumed markers ---------------------
 
     def test_destructive_view_consume_inside_for_loop_persists_post_loop(self):
         """A destructive view consume inside a loop body must mark consumed slots."""
-        from qamomile.circuit.transpiler.errors import (
-            QubitConsumedError,
-            SliceBorrowViolationError,
-        )
+        from qamomile.circuit.transpiler.errors import QubitConsumedError
 
         @qmc.qkernel
         def kern(obs: qmc.Observable) -> qmc.Float:
@@ -2907,35 +3637,33 @@ class TestRound5Reviewer:
             return qmc.expval(q, obs)
 
         H = qm_o.Z(0)
-        with pytest.raises((QubitConsumedError, SliceBorrowViolationError)):
+        with pytest.raises(QubitConsumedError):
             _ = kern.build(obs=H)
 
     def test_consumed_marker_in_loop_body_does_not_leak_across_registers(self):
         """The loop-body merge respects the per-root namespace.
 
-        Combines R5-B (per-root namespacing) and R5-C (loop-body
-        merge): a destructive view consume on register ``a`` inside a
-        ``for`` body must mark ``a``'s slots post-loop, but must not
-        bleed into register ``b`` (whose identical-numbered slot would
-        have collided under a non-namespaced key).
+        A destructive view consume on register ``a`` inside a ``for`` body
+        must mark ``a``'s slots after the loop without bleeding into register
+        ``b``, whose identically numbered slots share no ownership state.
         """
         pytest.importorskip("qiskit")
         from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
-        def kern(obs: qmc.Observable) -> qmc.Float:
+        def kern() -> qmc.Vector[qmc.Bit]:
             a = qmc.qubit_array(4, "a")
             b = qmc.qubit_array(4, "b")
             for _ in qmc.range(1):
                 _ = qmc.measure(a[1::2])  # destroys a[1], a[3]
-            # b is untouched — must stay valid.
-            return qmc.expval(b, obs)
+            # b is untouched — its identical-numbered slot must stay valid.
+            b[1] = qmc.x(b[1])
+            return qmc.measure(b)
 
-        H = qm_o.Z(1)
         transpiler = QiskitTranspiler()
         # b's expval must succeed despite a's destructive consume sharing
         # the same slot indices {1, 3}.
-        exe = transpiler.transpile(kern, bindings={"obs": H})
+        exe = transpiler.transpile(kern)
         assert exe is not None
 
 
@@ -3265,13 +3993,11 @@ class TestSliceAssignment:
         Releasing an outer-registered view from inside a control-flow body
         would require the loop / branch merge to propagate the entry
         deletion outward, which the current consumption-priority union
-        cannot do safely.  The pass raises ``SliceBorrowViolationError``
+        cannot do safely. The pass raises ``ValidationError``
         with a hint pointing at the control-flow region.
         """
         pytest.importorskip("qiskit")
-        from qamomile.circuit.transpiler.errors import (
-            SliceBorrowViolationError,
-        )
+        from qamomile.circuit.transpiler.errors import ValidationError
         from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
@@ -3284,13 +4010,13 @@ class TestSliceAssignment:
             return qmc.measure(q)
 
         transpiler = QiskitTranspiler()
-        with pytest.raises(SliceBorrowViolationError, match="control-flow body"):
+        with pytest.raises(ValidationError, match="control-flow body"):
             transpiler.transpile(kern)
 
     def test_one_entry_items_keeps_outer_view_release_boundary(self):
         """One-entry items lowering cannot hide an in-body slice release."""
         pytest.importorskip("qiskit")
-        from qamomile.circuit.transpiler.errors import SliceBorrowViolationError
+        from qamomile.circuit.transpiler.errors import ValidationError
         from qamomile.qiskit import QiskitTranspiler
 
         @qmc.qkernel
@@ -3303,5 +4029,5 @@ class TestSliceAssignment:
                 q[0::2] = even
             return qmc.measure(q)
 
-        with pytest.raises(SliceBorrowViolationError, match="control-flow body"):
+        with pytest.raises(ValidationError, match="control-flow body"):
             QiskitTranspiler().transpile(kern, bindings={"data": {0: 1.0}})

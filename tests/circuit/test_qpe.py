@@ -25,6 +25,7 @@ from qamomile.circuit.ir.operation.gate import (
 )
 from qamomile.circuit.ir.types import QFixedType
 from qamomile.circuit.ir.value import Value
+from qamomile.circuit.transpiler.errors import SeparationError
 from qamomile.circuit.transpiler.passes.separate import lower_operations
 
 
@@ -122,6 +123,39 @@ def builtin_qpe(n: int, phase: float) -> qmc.Float:
     target = qmc.x(target)
     phase_q: qmc.QFixed = qmc.qpe(target, q_phase, _p_gate, theta=phase)
     return qmc.measure(phase_q)
+
+
+@qmc.qkernel
+def _swap_with_private_workspace(
+    work: qmc.Vector[qmc.Qubit],
+) -> qmc.Vector[qmc.Qubit]:
+    """Apply an order-two unitary while restoring private workspace.
+
+    Args:
+        work (qmc.Vector[qmc.Qubit]): Two-qubit value register.
+
+    Returns:
+        qmc.Vector[qmc.Qubit]: Register with its two basis bits swapped.
+    """
+    workspace = qmc.qubit("workspace")
+    workspace = qmc.x(workspace)
+    workspace = qmc.x(workspace)
+    work[0], work[1] = qmc.swap(work[0], work[1])
+    return work
+
+
+@qmc.qkernel
+def qpe_with_private_workspace_unitary() -> qmc.Float:
+    """Estimate the order-two phase of a workspace-allocating unitary.
+
+    Returns:
+        qmc.Float: Two-bit phase estimate, either zero or one half.
+    """
+    counting = qmc.qubit_array(2, name="counting")
+    work = qmc.qubit_array(2, name="work")
+    work[0] = qmc.x(work[0])
+    phase = qmc.qpe(work, counting, _swap_with_private_workspace)
+    return qmc.measure(phase)
 
 
 @qmc.qkernel
@@ -252,7 +286,7 @@ def _assert_fallback_qpe_vector_view_phase(transpiler: Any) -> None:
     """Assert fallback QPE resolves and executes a VectorView phase operand.
 
     Args:
-        transpiler (Any): Backend transpiler exposing ``transpile`` and
+        transpiler (Any): Engine transpiler exposing ``transpile`` and
             ``executor`` methods.
     """
     executable = transpiler.transpile(
@@ -271,7 +305,7 @@ def _assert_builtin_qpe_vector_view_phase(transpiler: Any) -> None:
     """Assert public QPE resolves and executes a VectorView phase operand.
 
     Args:
-        transpiler (Any): Backend transpiler exposing ``transpile`` and
+        transpiler (Any): Engine transpiler exposing ``transpile`` and
             ``executor`` methods.
     """
     executable = transpiler.transpile(
@@ -326,7 +360,14 @@ class TestQPEBuiltin:
     """Built-in QPE (qmc.qpe()) tests."""
 
     def test_symbolic_counting_size_keeps_deferred_iqft_and_cast(self):
-        """Symbolic-size QPE keeps IQFT and QFixed cast as deferred aliases."""
+        """Symbolic-size QPE keeps IQFT and QFixed cast as deferred aliases.
+
+        The deferred alias is a trace-time artifact only: plan-time lowering
+        refuses to measure a register whose source length is still symbolic,
+        because the host-side decode would otherwise bake in a zero width.
+        Binding the size first lowers the same program to a concrete vector
+        measurement over the phase register.
+        """
         block = builtin_qpe.block
 
         iqft_ops = [
@@ -346,12 +387,16 @@ class TestQPEBuiltin:
 
         assert any(isinstance(op, MeasureQFixedOperation) for op in block.operations)
 
-        lowered = lower_operations(block)
+        with pytest.raises(SeparationError, match="symbolic at plan time"):
+            lower_operations(block)
+
+        bound_block = builtin_qpe.build(n=3, phase=math.pi / 2)
+        lowered = lower_operations(bound_block)
         measure_vector_ops = [
             op for op in lowered.operations if isinstance(op, MeasureVectorOperation)
         ]
         assert len(measure_vector_ops) == 1
-        assert measure_vector_ops[0].operands[0].uuid == cast_ops[0].operands[0].uuid
+        assert measure_vector_ops[0].operands[0].shape[0].get_const() == 3
 
     def test_qpe_controlled_unitary_carries_callable_ref_and_attrs(self):
         """Built-in QPE records the target unitary identity and attrs in IR.
@@ -436,6 +481,15 @@ class TestQPEBuiltin:
                 f"Built-in QPE: expected 0.125, got {value} (count={count})"
             )
 
+    def test_qpe_controls_unitary_with_private_workspace(self, qiskit_transpiler):
+        """QPE reserves and controls a unitary's internal ancilla wires."""
+        executable = qiskit_transpiler.transpile(qpe_with_private_workspace_unitary)
+        result = executable.sample(qiskit_transpiler.executor(), shots=64).result()
+
+        phases = {value for value, _ in result.results}
+        assert phases <= {0.0, 0.5}
+        assert phases == {0.0, 0.5}
+
 
 class TestQPEFallbackVectorViewPhase:
     """Fallback QPE composite emission with VectorView phase operands."""
@@ -463,6 +517,14 @@ class TestQPEFallbackVectorViewPhase:
 
         _assert_fallback_qpe_vector_view_phase(CudaqTranspiler())
 
+    @pytest.mark.braket
+    def test_braket_executes_vector_view_phase(self):
+        """Amazon Braket executes fallback QPE with a VectorView phase."""
+        pytest.importorskip("braket")
+        from qamomile.braket import BraketTranspiler
+
+        _assert_fallback_qpe_vector_view_phase(BraketTranspiler())
+
 
 class TestQPEBuiltinVectorViewPhase:
     """Public QPE with VectorView phase operands."""
@@ -489,6 +551,14 @@ class TestQPEBuiltinVectorViewPhase:
         from qamomile.cudaq import CudaqTranspiler
 
         _assert_builtin_qpe_vector_view_phase(CudaqTranspiler())
+
+    @pytest.mark.braket
+    def test_braket_executes_vector_view_phase(self):
+        """Amazon Braket executes public QPE with a VectorView phase."""
+        pytest.importorskip("braket")
+        from qamomile.braket import BraketTranspiler
+
+        _assert_builtin_qpe_vector_view_phase(BraketTranspiler())
 
 
 class TestQPEConsistency:

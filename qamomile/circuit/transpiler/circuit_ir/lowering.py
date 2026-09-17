@@ -1,9 +1,16 @@
-"""Lower circuit-family execution plans into backend-neutral circuit IR."""
+"""Lower circuit-family execution plans into engine-neutral circuit IR."""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
+from qamomile._utils import is_plain_int
+from qamomile.circuit.ir.block import Block
+from qamomile.circuit.ir.canonical import (
+    collect_reachable_values,
+    content_fingerprint,
+)
 from qamomile.circuit.ir.operation.arithmetic_operations import (
     CompOp,
     CompOpKind,
@@ -23,24 +30,38 @@ from qamomile.circuit.ir.operation.control_flow import (
     validate_region_args,
 )
 from qamomile.circuit.ir.operation.pauli_evolve import PauliEvolveOp
+from qamomile.circuit.ir.operation.select import SelectOperation
 from qamomile.circuit.ir.value import ArrayValue, Value
 from qamomile.circuit.transpiler.circuit_ir.emitter import CircuitGateEmitter
 from qamomile.circuit.transpiler.circuit_ir.model import (
+    SELECT_SEMANTIC_KEY,
     BinaryExpr,
     BinaryOperator,
     CallableIdentity,
+    CallInstruction,
     CircuitBuilder,
+    CircuitInstruction,
     CircuitProgram,
     ClassicalBitExpr,
+    ForInstruction,
+    GateInstruction,
+    IfInstruction,
     LiteralExpr,
     LoopVariableExpr,
     ParameterExpr,
+    PauliEvolutionInstruction,
     ReusableCircuit,
     ScalarExpr,
     SemanticArguments,
     SemanticOpKey,
     UnaryExpr,
     UnaryOperator,
+    WhileInstruction,
+    _contains_classical_bit,
+    _is_zero_scalar,
+)
+from qamomile.circuit.transpiler.circuit_ir.parameter_usage import (
+    reconcile_parameter_metadata,
 )
 from qamomile.circuit.transpiler.circuit_ir.verify import verify_circuit
 from qamomile.circuit.transpiler.compiled_segments import CompiledQuantumSegment
@@ -55,6 +76,22 @@ from qamomile.circuit.transpiler.passes.emit_support.control_flow_emission impor
     resolve_if_condition,
     restore_runtime_condition_sources,
     snapshot_runtime_condition_sources,
+)
+from qamomile.circuit.transpiler.passes.emit_support.control_value_emission import (
+    bracket_control_value,
+)
+from qamomile.circuit.transpiler.passes.emit_support.controlled_block_support import (
+    _bind_quantum_input_shapes,
+    _expand_quantum_operands_to_phys,
+    _prepare_nested_block_for_emit,
+)
+from qamomile.circuit.transpiler.passes.emit_support.controlled_emission import (
+    _is_single_target_block_vector_broadcast,
+    _map_operand_result_groups,
+    build_controlled_block_qubit_map,
+)
+from qamomile.circuit.transpiler.passes.emit_support.gate_emission import (
+    reject_duplicate_physical_indices,
 )
 from qamomile.circuit.transpiler.passes.emit_support.qubit_address import QubitAddress
 from qamomile.circuit.transpiler.passes.standard_emit import StandardEmitPass
@@ -77,6 +114,213 @@ _RUNTIME_BINARY_OPERATORS = {
     RuntimeOpKind.MOD: BinaryOperator.MOD,
     RuntimeOpKind.POW: BinaryOperator.POW,
 }
+
+
+def _circuit_program_fingerprint(program: CircuitProgram) -> str:
+    """Return a deterministic behavior fingerprint for lowered circuit IR.
+
+    Display-only names are removed and lexically bound loop variables are
+    alpha-renamed before hashing. This lets SELECT compare equivalent case
+    bodies independently of Python callable and induction-variable names.
+
+    Args:
+        program (CircuitProgram): Lowered reusable case body.
+
+    Returns:
+        str: Hexadecimal SHA-256 content digest.
+    """
+    normalized = _normalize_circuit_program(program, {}, [0])
+    return content_fingerprint(normalized)
+
+
+def _normalize_circuit_program(
+    program: CircuitProgram,
+    loop_names: dict[str, str],
+    next_loop_id: list[int],
+) -> CircuitProgram:
+    """Remove display names and alpha-normalize one circuit program.
+
+    Args:
+        program (CircuitProgram): Circuit program to normalize recursively.
+        loop_names (dict[str, str]): Active source-to-canonical loop binders.
+        next_loop_id (list[int]): Mutable one-element canonical binder counter.
+
+    Returns:
+        CircuitProgram: Equivalent normalized circuit program.
+    """
+    return dataclasses.replace(
+        program,
+        name="",
+        operations=tuple(
+            _normalize_instruction(operation, loop_names, next_loop_id)
+            for operation in program.operations
+        ),
+        global_phase=_normalize_scalar_expression(program.global_phase, loop_names),
+    )
+
+
+def _normalize_instruction(
+    instruction: CircuitInstruction,
+    loop_names: dict[str, str],
+    next_loop_id: list[int],
+) -> CircuitInstruction:
+    """Normalize display names and loop references in one instruction.
+
+    Args:
+        instruction (CircuitInstruction): Instruction to normalize.
+        loop_names (dict[str, str]): Active source-to-canonical loop binders.
+        next_loop_id (list[int]): Mutable one-element canonical binder counter.
+
+    Returns:
+        CircuitInstruction: Semantically equivalent normalized instruction.
+    """
+    if isinstance(instruction, GateInstruction):
+        return dataclasses.replace(
+            instruction,
+            parameters=tuple(
+                _normalize_scalar_expression(parameter, loop_names)
+                for parameter in instruction.parameters
+            ),
+        )
+    if isinstance(instruction, PauliEvolutionInstruction):
+        return dataclasses.replace(
+            instruction,
+            time=_normalize_scalar_expression(instruction.time, loop_names),
+        )
+    if isinstance(instruction, CallInstruction):
+        return dataclasses.replace(
+            instruction,
+            callee=_normalize_reusable_circuit(
+                instruction.callee,
+                loop_names,
+                next_loop_id,
+            ),
+        )
+    if isinstance(instruction, ForInstruction):
+        canonical_name = f"bound:{next_loop_id[0]}"
+        next_loop_id[0] += 1
+        body_loop_names = dict(loop_names)
+        body_loop_names[instruction.loop_variable.name] = canonical_name
+        return dataclasses.replace(
+            instruction,
+            loop_variable=LoopVariableExpr(canonical_name),
+            body=tuple(
+                _normalize_instruction(operation, body_loop_names, next_loop_id)
+                for operation in instruction.body
+            ),
+        )
+    if isinstance(instruction, IfInstruction):
+        return dataclasses.replace(
+            instruction,
+            condition=_normalize_scalar_expression(instruction.condition, loop_names),
+            true_body=tuple(
+                _normalize_instruction(operation, loop_names, next_loop_id)
+                for operation in instruction.true_body
+            ),
+            false_body=tuple(
+                _normalize_instruction(operation, loop_names, next_loop_id)
+                for operation in instruction.false_body
+            ),
+            true_global_phase=_normalize_scalar_expression(
+                instruction.true_global_phase,
+                loop_names,
+            ),
+            false_global_phase=_normalize_scalar_expression(
+                instruction.false_global_phase,
+                loop_names,
+            ),
+        )
+    if isinstance(instruction, WhileInstruction):
+        return dataclasses.replace(
+            instruction,
+            condition=_normalize_scalar_expression(instruction.condition, loop_names),
+            body=tuple(
+                _normalize_instruction(operation, loop_names, next_loop_id)
+                for operation in instruction.body
+            ),
+            body_global_phase=_normalize_scalar_expression(
+                instruction.body_global_phase,
+                loop_names,
+            ),
+        )
+    return instruction
+
+
+def _normalize_reusable_circuit(
+    callee: ReusableCircuit,
+    loop_names: dict[str, str],
+    next_loop_id: list[int],
+) -> ReusableCircuit:
+    """Normalize one reusable circuit nested in the current lexical scope.
+
+    Args:
+        callee (ReusableCircuit): Reusable circuit to normalize.
+        loop_names (dict[str, str]): Active source-to-canonical loop binders.
+        next_loop_id (list[int]): Mutable one-element canonical binder counter.
+
+    Returns:
+        ReusableCircuit: Equivalent reusable circuit without display names.
+    """
+    identity = callee.identity
+    if identity is not None:
+        identity = dataclasses.replace(identity, symbol="")
+    return dataclasses.replace(
+        callee,
+        body=_normalize_circuit_program(callee.body, loop_names, next_loop_id),
+        name="",
+        identity=identity,
+    )
+
+
+def _normalize_scalar_expression(
+    expression: ScalarExpr,
+    loop_names: dict[str, str],
+) -> ScalarExpr:
+    """Alpha-normalize loop references in one scalar expression.
+
+    Bound and free references receive disjoint prefixes so a source name cannot
+    collide with a generated binder name.
+
+    Args:
+        expression (ScalarExpr): Scalar expression to normalize recursively.
+        loop_names (dict[str, str]): Active source-to-canonical loop binders.
+
+    Returns:
+        ScalarExpr: Equivalent expression with normalized loop references.
+    """
+    if isinstance(expression, LoopVariableExpr):
+        normalized_name = loop_names.get(expression.name, f"free:{expression.name}")
+        return dataclasses.replace(expression, name=normalized_name)
+    if isinstance(expression, BinaryExpr):
+        return dataclasses.replace(
+            expression,
+            left=_normalize_scalar_expression(expression.left, loop_names),
+            right=_normalize_scalar_expression(expression.right, loop_names),
+        )
+    if isinstance(expression, UnaryExpr):
+        return dataclasses.replace(
+            expression,
+            operand=_normalize_scalar_expression(expression.operand, loop_names),
+        )
+    return expression
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoweredSelectCase:
+    """Store one verified SELECT case lowering for pass-local reuse.
+
+    Args:
+        source_block (Block): Source block retained to prevent ``id`` reuse
+            while this cache entry is live.
+        program (CircuitProgram): Immutable verified local case program.
+        broadcast (bool): Whether the scalar case is broadcast over a vector.
+        fingerprint (str): Normalized behavior fingerprint of ``program``.
+    """
+
+    source_block: Block
+    program: CircuitProgram
+    broadcast: bool
+    fingerprint: str
 
 
 class CircuitLoweringPass(StandardEmitPass[CircuitBuilder]):
@@ -106,9 +350,472 @@ class CircuitLoweringPass(StandardEmitPass[CircuitBuilder]):
             CircuitGateEmitter(),
             bindings=bindings,
             parameters=parameters,
-            backend_name="circuit_ir",
+            engine_name="circuit_ir",
         )
         self._composite_emitters.append(_SemanticCompositeEmitter(self))
+        self._select_case_cache: dict[
+            tuple[int, int, tuple[tuple[bool, int], ...], str],
+            _LoweredSelectCase,
+        ] = {}
+        self._select_case_binding_keys: dict[
+            int,
+            tuple[Block, frozenset[str]],
+        ] = {}
+
+    def run(self, input: ProgramPlan) -> ExecutableProgram[CircuitBuilder]:
+        """Lower one program plan with a fresh SELECT case cache.
+
+        Args:
+            input (ProgramPlan): Segmented program plan to lower.
+
+        Returns:
+            ExecutableProgram[CircuitBuilder]: Lowered executable builders.
+        """
+        self._select_case_cache.clear()
+        self._select_case_binding_keys.clear()
+        try:
+            return super().run(input)
+        finally:
+            self._select_case_cache.clear()
+            self._select_case_binding_keys.clear()
+
+    def _emit_select(
+        self,
+        circuit: CircuitBuilder,
+        op: SelectOperation,
+        qubit_map: QubitMap,
+        bindings: dict[str, Any],
+        outer_control_indices: list[int] | None = None,
+    ) -> None:
+        """Lower SELECT as one semantic call with controlled case calls.
+
+        The outer call preserves SELECT identity for target legalization. Its
+        fallback body uses local index slots followed by local target slots.
+        Each nontrivial case is a reusable body controlled by every index bit;
+        the shared ``control_value`` lowering brackets zero-valued bits with X
+        gates in the portable fallback.
+
+        Args:
+            circuit (CircuitBuilder): Parent circuit builder.
+            op (SelectOperation): Semantic multiplexer operation.
+            qubit_map (QubitMap): Current semantic-value to physical-slot map.
+            bindings (dict[str, Any]): Active compile-time and loop bindings.
+            outer_control_indices (list[int] | None): Controls inherited from
+                an enclosing controlled call. Defaults to ``None``.
+
+        Returns:
+            None: The semantic call is appended to ``circuit`` in place.
+
+        Raises:
+            EmitError: If an operand cannot be resolved, physical operands
+                alias, or a case cannot be lowered as a unitary reusable body.
+        """
+        inherited_controls = list(outer_control_indices or ())
+        index_width = self._resolve_select_index_width(op, bindings)
+        index_groups = [
+            _expand_quantum_operands_to_phys(
+                self,
+                operand,
+                qubit_map,
+                bindings,
+                operation="SelectOperation",
+            )
+            for operand in op.index_operands
+        ]
+        index_indices = [physical for group in index_groups for physical in group]
+        if len(index_indices) != index_width:
+            raise EmitError(
+                f"SelectOperation index arguments expanded to "
+                f"{len(index_indices)} qubit(s), but num_index_qubits "
+                f"resolves to {index_width}. The flattened index prefix must "
+                f"match the declared width exactly.",
+                operation="SelectOperation",
+            )
+
+        target_groups = [
+            _expand_quantum_operands_to_phys(
+                self,
+                operand,
+                qubit_map,
+                bindings,
+                operation="SelectOperation",
+            )
+            for operand in op.target_operands
+        ]
+        target_indices = [physical for group in target_groups for physical in group]
+        if not target_indices:
+            raise EmitError(
+                "SelectOperation requires at least one target qubit.",
+                operation="SelectOperation",
+            )
+        reject_duplicate_physical_indices(
+            "SelectOperation",
+            [*inherited_controls, *index_indices, *target_indices],
+        )
+
+        target_widths = tuple(len(group) for group in target_groups)
+        fallback = CircuitBuilder(
+            index_width + len(target_indices),
+            0,
+            name="select",
+        )
+        local_indices = tuple(range(index_width))
+        local_targets = tuple(range(index_width, index_width + len(target_indices)))
+        target_shape = tuple(
+            (isinstance(operand, ArrayValue), width)
+            for operand, width in zip(
+                op.target_operands,
+                target_widths,
+                strict=True,
+            )
+        )
+        case_fingerprints: list[str] = []
+        for case_index, case_block in enumerate(op.case_blocks):
+            lowered_case = self._lower_select_case_cached(
+                case_block,
+                op.target_operands,
+                op.param_operands,
+                target_indices,
+                target_shape,
+                bindings,
+                case_index,
+            )
+            case_program = lowered_case.program
+            broadcast = lowered_case.broadcast
+            case_fingerprints.append(lowered_case.fingerprint)
+            if not case_program.operations and _is_zero_scalar(
+                case_program.global_phase
+            ):
+                continue
+
+            case_callee = ReusableCircuit(
+                body=case_program,
+                name=case_program.name,
+                controls=index_width,
+                operand_widths=(1,) if broadcast else target_widths,
+            )
+            with bracket_control_value(
+                self,
+                fallback,
+                local_indices,
+                case_index,
+            ):
+                if broadcast:
+                    for target in local_targets:
+                        fallback.append_call(
+                            case_callee,
+                            (*local_indices, target),
+                        )
+                else:
+                    fallback.append_call(
+                        case_callee,
+                        (*local_indices, *local_targets),
+                    )
+
+        select_callee = ReusableCircuit(
+            body=fallback.freeze(),
+            name="select",
+            controls=len(inherited_controls),
+            identity=CallableIdentity(
+                key=SELECT_SEMANTIC_KEY,
+                symbol="select",
+                arguments=SemanticArguments.from_mapping(
+                    {
+                        "case_fingerprints": tuple(case_fingerprints),
+                        "index_order": "lsb0",
+                        "num_cases": op.num_cases,
+                        "num_index_qubits": index_width,
+                    }
+                ),
+            ),
+            operand_widths=(index_width, *target_widths),
+        )
+        circuit.append_call(
+            select_callee,
+            (*inherited_controls, *index_indices, *target_indices),
+        )
+
+        _map_operand_result_groups(
+            op.results[: op.num_index_args],
+            index_groups,
+            qubit_map,
+        )
+        target_results = [
+            result
+            for result in op.results[op.num_index_args :]
+            if result.type.is_quantum()
+        ]
+        _map_operand_result_groups(target_results, target_groups, qubit_map)
+
+    def _resolve_select_index_width(
+        self,
+        operation: SelectOperation,
+        bindings: dict[str, Any],
+    ) -> int:
+        """Resolve and validate a SELECT index-register width.
+
+        Args:
+            operation (SelectOperation): SELECT operation whose concrete or
+                symbolic width is required.
+            bindings (dict[str, Any]): Active compile-time and loop bindings.
+
+        Returns:
+            int: Positive concrete index width able to address every case.
+
+        Raises:
+            EmitError: If a symbolic width cannot be resolved, is not positive,
+                or cannot address all case blocks.
+        """
+        width = operation.num_index_qubits
+        if isinstance(width, Value):
+            resolved = self._resolver.resolve_classical_value(width, bindings)
+            if resolved is None:
+                raise EmitError(
+                    f"Cannot resolve num_index_qubits Value {width.name!r} "
+                    f"for SELECT lowering.",
+                    operation="SelectOperation",
+                )
+            if not is_plain_int(resolved):
+                raise EmitError(
+                    "SelectOperation num_index_qubits must resolve to a "
+                    f"Python int, got {resolved!r}.",
+                    operation="SelectOperation",
+                )
+            assert isinstance(resolved, int)
+            concrete_width = resolved
+        else:
+            concrete_width = width
+        if concrete_width < 1:
+            raise EmitError(
+                f"SelectOperation resolved num_index_qubits={concrete_width}; "
+                f"the width must be a strictly positive integer.",
+                operation="SelectOperation",
+            )
+        minimum_width = (operation.num_cases - 1).bit_length()
+        if concrete_width < minimum_width:
+            raise EmitError(
+                f"SelectOperation has {operation.num_cases} case blocks, but "
+                f"num_index_qubits={concrete_width}; at least {minimum_width} "
+                f"index qubit(s) are required to address every case.",
+                operation="SelectOperation",
+            )
+        return concrete_width
+
+    def _lower_select_case_cached(
+        self,
+        case_block: Block,
+        target_operands: list[Value],
+        parameter_operands: list[Value],
+        target_indices: list[int],
+        target_shape: tuple[tuple[bool, int], ...],
+        bindings: dict[str, Any],
+        case_index: int,
+    ) -> _LoweredSelectCase:
+        """Return one lowered SELECT case, reusing a safe specialization.
+
+        Only the case's formal parameters and quantum input shapes contribute
+        to its body. Unrelated outer-loop bindings are deliberately excluded,
+        so a parameter-free case is lowered once across a statically unrolled
+        loop. Values without a stable structural fingerprint bypass the cache.
+
+        Args:
+            case_block (Block): Specialized semantic case block.
+            target_operands (list[Value]): Shared quantum call-site operands.
+            parameter_operands (list[Value]): Shared classical operands.
+            target_indices (list[int]): Flattened parent target slots.
+            target_shape (tuple[tuple[bool, int], ...]): Per-target array flag
+                and concrete width.
+            bindings (dict[str, Any]): Parent compile-time and loop bindings.
+            case_index (int): Case position used in names and diagnostics.
+
+        Returns:
+            _LoweredSelectCase: Verified program, broadcast mode, and digest.
+
+        Raises:
+            EmitError: If the case cannot be lowered as a unitary reusable
+                body.
+        """
+        local_bindings = self._resolver.bind_block_params(
+            case_block,
+            parameter_operands,
+            bindings,
+            parameter_factory=self._get_or_create_parameter,
+        )
+        _bind_quantum_input_shapes(
+            self._resolver,
+            case_block,
+            target_operands,
+            bindings,
+            local_bindings,
+        )
+        cache_key = None
+        if not self._counting_emission:
+            cache_key = self._select_case_cache_key(
+                case_block,
+                case_index,
+                target_shape,
+                local_bindings,
+            )
+        if cache_key is not None:
+            cached = self._select_case_cache.get(cache_key)
+            if cached is not None and cached.source_block is case_block:
+                return cached
+
+        program, broadcast = self._lower_select_case(
+            case_block,
+            target_operands,
+            target_indices,
+            local_bindings,
+            case_index,
+        )
+        lowered = _LoweredSelectCase(
+            source_block=case_block,
+            program=program,
+            broadcast=broadcast,
+            fingerprint=_circuit_program_fingerprint(program),
+        )
+        if cache_key is not None:
+            self._select_case_cache[cache_key] = lowered
+        return lowered
+
+    def _select_case_cache_key(
+        self,
+        case_block: Block,
+        case_index: int,
+        target_shape: tuple[tuple[bool, int], ...],
+        local_bindings: dict[str, Any],
+    ) -> tuple[int, int, tuple[tuple[bool, int], ...], str] | None:
+        """Build a stable key for one SELECT case specialization.
+
+        Args:
+            case_block (Block): Source case block.
+            case_index (int): Case position determining its fallback name.
+            target_shape (tuple[tuple[bool, int], ...]): Per-target array flag
+                and concrete width.
+            local_bindings (dict[str, Any]): Case-local parameter and shape
+                bindings.
+
+        Returns:
+            tuple[int, int, tuple[tuple[bool, int], ...], str] | None: Cache
+                key, or ``None`` when a binding has no deterministic token.
+        """
+        reachable_keys = self._select_case_reachable_binding_keys(case_block)
+        specialization = {
+            key: value for key, value in local_bindings.items() if key in reachable_keys
+        }
+        try:
+            binding_fingerprint = content_fingerprint(specialization)
+        except TypeError:
+            return None
+        return id(case_block), case_index, target_shape, binding_fingerprint
+
+    def _select_case_reachable_binding_keys(
+        self,
+        case_block: Block,
+    ) -> frozenset[str]:
+        """Return binding keys reachable from one SELECT case block.
+
+        The projection includes formal inputs, captured legacy values, shape
+        and slice descriptors, and values inside operation-owned nested blocks.
+        This lets the cache ignore unrelated outer-loop bindings without
+        assuming that every accepted legacy block is closed over formals only.
+
+        Args:
+            case_block (Block): Case block whose reachable values to inspect.
+
+        Returns:
+            frozenset[str]: UUID, parameter-name, and legacy display-name keys
+                that can affect lowering of the block.
+        """
+        block_id = id(case_block)
+        cached = self._select_case_binding_keys.get(block_id)
+        if cached is not None and cached[0] is case_block:
+            return cached[1]
+
+        keys: set[str] = set()
+        for value in collect_reachable_values(case_block):
+            keys.add(value.uuid)
+            if value.is_parameter():
+                parameter_name = value.parameter_name()
+                if parameter_name:
+                    keys.add(parameter_name)
+            if value.name:
+                keys.add(value.name)
+        result = frozenset(keys)
+        self._select_case_binding_keys[block_id] = (case_block, result)
+        return result
+
+    def _lower_select_case(
+        self,
+        case_block: Block,
+        target_operands: list[Value],
+        target_indices: list[int],
+        local_bindings: dict[str, Any],
+        case_index: int,
+    ) -> tuple[CircuitProgram, bool]:
+        """Lower one SELECT case into an independent reusable program.
+
+        Args:
+            case_block (Block): Specialized semantic case block.
+            target_operands (list[Value]): Shared quantum operands supplied at
+                the SELECT call site.
+            target_indices (list[int]): Flattened parent target slots, used only
+                to determine scalar-to-vector broadcast shape.
+            local_bindings (dict[str, Any]): Case-local parameters and shapes.
+            case_index (int): Case position used in names and diagnostics.
+
+        Returns:
+            tuple[CircuitProgram, bool]: Lowered body and whether it represents
+            a scalar case broadcast over every target element.
+
+        Raises:
+            EmitError: If the case allocates hidden quantum/classical resources
+                or cannot be lowered into its declared target width.
+        """
+        prepared = _prepare_nested_block_for_emit(case_block, local_bindings)
+        broadcast = _is_single_target_block_vector_broadcast(
+            prepared,
+            target_operands,
+        )
+        case_width = 1 if broadcast else len(target_indices)
+        local_map = build_controlled_block_qubit_map(
+            self,
+            prepared,
+            list(range(case_width)),
+            local_bindings,
+        )
+        with self._allocator.preserving_analysis_state():
+            local_map, local_clbits = self._allocator.allocate(
+                prepared.operations,
+                local_bindings,
+                initial_qubit_map=local_map,
+                initial_clbit_map={},
+            )
+        allocated_qubits = max(local_map.values(), default=-1) + 1
+        if allocated_qubits > case_width or local_clbits:
+            raise EmitError(
+                f"SELECT case {case_index} requires hidden quantum or "
+                f"classical resources; cases must be unitary on exactly the "
+                f"shared target register.",
+                operation="SelectOperation",
+            )
+
+        builder = CircuitBuilder(
+            case_width,
+            0,
+            name=prepared.name or f"select_case_{case_index}",
+        )
+        self._emit_operations(
+            builder,
+            prepared.operations,
+            local_map,
+            local_clbits,
+            local_bindings,
+            force_unroll=True,
+        )
+        program = builder.freeze()
+        verify_circuit(program)
+        return program, broadcast
 
     def _runtime_operand(
         self,
@@ -422,29 +1129,16 @@ class CircuitLoweringPass(StandardEmitPass[CircuitBuilder]):
         import qamomile.observable as qm_o
         from qamomile.circuit.transpiler.passes.emit_support.pauli_evolve_emission import (
             _resolve_gamma,
+            is_zero_evolution_time,
             validate_hamiltonian_within_register,
+            validate_hermitian_hamiltonian,
         )
-        from qamomile.observable.hamiltonian import HERMITIAN_IMAG_ATOL
 
         hamiltonian = self._resolver.resolve_bound_value(op.observable, bindings)
         if not isinstance(hamiltonian, qm_o.Hamiltonian):
             raise EmitError("PauliEvolveOp requires a Hamiltonian binding")
-        if abs(hamiltonian.constant.imag) > HERMITIAN_IMAG_ATOL:
-            raise EmitError(
-                "PauliEvolveOp requires a real Hamiltonian constant; "
-                "a complex constant is non-Hermitian",
-                operation="PauliEvolveOp",
-            )
+        validate_hermitian_hamiltonian(hamiltonian)
         gamma = _resolve_gamma(self, op, bindings)
-        if gamma is None:
-            raise EmitError("Cannot resolve Pauli evolution time")
-        for operators, coefficient in hamiltonian:
-            if abs(coefficient.imag) > HERMITIAN_IMAG_ATOL:
-                raise EmitError(
-                    f"PauliEvolveOp requires a Hermitian Hamiltonian, but "
-                    f"coefficient {coefficient} on term {operators} is non-real",
-                    operation="PauliEvolveOp",
-                )
 
         input_array = op.qubits
         if not isinstance(input_array, ArrayValue):
@@ -474,11 +1168,12 @@ class CircuitLoweringPass(StandardEmitPass[CircuitBuilder]):
                     f"Cannot resolve qubit {index} for PauliEvolveOp",
                     operation="PauliEvolveOp",
                 ) from error
-        circuit.append_pauli_evolution(
-            tuple(qubit_indices),
-            hamiltonian,
-            gamma,
-        )
+        if not is_zero_evolution_time(gamma):
+            circuit.append_pauli_evolution(
+                tuple(qubit_indices),
+                hamiltonian,
+                gamma,
+            )
 
         result_array = op.evolved_qubits
         if not isinstance(result_array, ArrayValue):
@@ -634,26 +1329,6 @@ _SCALAR_EXPR_TYPES = (
 )
 
 
-def _contains_classical_bit(expression: ScalarExpr) -> bool:
-    """Return whether an expression depends on a measured classical bit.
-
-    Args:
-        expression (ScalarExpr): Expression to inspect.
-
-    Returns:
-        bool: True when a :class:`ClassicalBitExpr` occurs recursively.
-    """
-    if isinstance(expression, ClassicalBitExpr):
-        return True
-    if isinstance(expression, BinaryExpr):
-        return _contains_classical_bit(expression.left) or _contains_classical_bit(
-            expression.right
-        )
-    if isinstance(expression, UnaryExpr):
-        return _contains_classical_bit(expression.operand)
-    return False
-
-
 def lower_circuit_plan(
     plan: ProgramPlan,
     bindings: dict[str, Any] | None = None,
@@ -662,7 +1337,7 @@ def lower_circuit_plan(
     """Lower every quantum segment in a plan to immutable circuit IR.
 
     Classical and expectation-value orchestration metadata remains in the
-    returned executable container. Only backend-native quantum artifacts are
+    returned executable container. Only engine-native quantum artifacts are
     replaced with verified :class:`CircuitProgram` objects.
 
     Args:
@@ -674,7 +1349,7 @@ def lower_circuit_plan(
 
     Returns:
         ExecutableProgram[CircuitProgram]: Execution structure containing
-            immutable backend-neutral quantum programs.
+            immutable engine-neutral quantum programs.
 
     Raises:
         EmitError: If the semantic operations cannot be lowered to the
@@ -686,6 +1361,10 @@ def lower_circuit_plan(
     for segment in lowered.compiled_quantum:
         program = segment.circuit.freeze()
         verify_circuit(program)
+        parameter_metadata = reconcile_parameter_metadata(
+            program,
+            segment.parameter_metadata,
+        )
         quantum_segments.append(
             CompiledQuantumSegment(
                 segment=segment.segment,
@@ -693,7 +1372,7 @@ def lower_circuit_plan(
                 qubit_map=segment.qubit_map,
                 clbit_map=segment.clbit_map,
                 measurement_qubit_map=segment.measurement_qubit_map,
-                parameter_metadata=segment.parameter_metadata,
+                parameter_metadata=parameter_metadata,
             )
         )
     return ExecutableProgram(

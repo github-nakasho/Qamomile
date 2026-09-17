@@ -5,10 +5,10 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, TypeAlias, cast
 
-from qamomile._utils import is_close_zero
+from qamomile._utils import coerce_nonnegative_integral, is_close_zero
 from qamomile.circuit.ir.block import Block
 from qamomile.circuit.ir.operation import Operation
 from qamomile.circuit.ir.operation.arithmetic_operations import (
@@ -20,35 +20,47 @@ from qamomile.circuit.ir.operation.arithmetic_operations import (
 )
 from qamomile.circuit.ir.operation.callable import (
     CallableRef,
-    CallPolicy,
     CallTransform,
     InvokeOperation,
 )
+from qamomile.circuit.ir.operation.cast import CastOperation
 from qamomile.circuit.ir.operation.control_flow import (
     ForOperation,
+    HasNestedOps,
     IfOperation,
     LoopCarriedRebind,
     WhileOperation,
     validate_region_args,
 )
+from qamomile.circuit.ir.operation.control_value import control_pattern_for_value
 from qamomile.circuit.ir.operation.gate import (
+    ConcreteControlledU,
     ControlledUOperation,
     GateOperation,
     GateOperationType,
     MeasureOperation,
+    MeasureQFixedOperation,
+    MeasureQIntOperation,
     MeasureVectorOperation,
     ProjectOperation,
     ResetOperation,
 )
+from qamomile.circuit.ir.operation.global_phase import GlobalPhaseOperation
 from qamomile.circuit.ir.operation.inverse_block import InverseBlockOperation
 from qamomile.circuit.ir.operation.operation import CInitOperation, QInitOperation
 from qamomile.circuit.ir.operation.pauli_evolve import PauliEvolveOp
 from qamomile.circuit.ir.operation.return_operation import ReturnOperation
+from qamomile.circuit.ir.operation.select import SelectOperation
+from qamomile.circuit.ir.operation.slice_array import (
+    ReleaseSliceViewOperation,
+    SliceArrayOperation,
+)
 from qamomile.circuit.ir.types import (
     BitType,
     FloatType,
     ObservableType,
     QubitType,
+    QUIntType,
     UIntType,
 )
 from qamomile.circuit.ir.types.primitives import ValueType
@@ -63,26 +75,41 @@ from qamomile.circuit.ir.value import (
     resolve_root_array_index,
     resolve_root_qubit_address,
 )
-from qamomile.circuit.transpiler.artifact import (
+from qamomile.circuit.transpiler import (
+    CallableDefinitionConflictError,
     CompilationMetadata,
     CompiledProgram,
-)
-from qamomile.circuit.transpiler.block_parameter_binding import pair_block_operands
-from qamomile.circuit.transpiler.errors import (
-    CallableDefinitionConflictError,
     EmitError,
+    PreparedModule,
+    inline_callables,
+    lower_compile_time_ifs_preserving_loop_conditions,
+    pair_block_operands,
+    validate_program_graph_semantics,
 )
-from qamomile.circuit.transpiler.passes.analyze import (
-    reject_control_flow_quantum_discard,
-)
-from qamomile.circuit.transpiler.passes.inline import InlinePass
-from qamomile.circuit.transpiler.passes.validate_while import (
-    ValidateWhileContractPass,
-)
-from qamomile.circuit.transpiler.prepared import PreparedModule
 
 _QuantumOrigin: TypeAlias = tuple[str, int | None]
 _QuantumFootprint: TypeAlias = frozenset[_QuantumOrigin]
+
+_BIT_COMPARISON_NAMES: Mapping[CompOpKind, str] = {
+    CompOpKind.EQ: "eq",
+    CompOpKind.NEQ: "xor",
+}
+_UINT_COMPARISON_NAMES: Mapping[CompOpKind, str] = {
+    CompOpKind.EQ: "ieq",
+    CompOpKind.NEQ: "ine",
+    CompOpKind.LT: "ilt_u",
+    CompOpKind.LE: "ile_u",
+    CompOpKind.GT: "igt_u",
+    CompOpKind.GE: "ige_u",
+}
+_FLOAT_COMPARISON_NAMES: Mapping[CompOpKind, str] = {
+    CompOpKind.EQ: "feq",
+    CompOpKind.NEQ: "fne",
+    CompOpKind.LT: "flt",
+    CompOpKind.LE: "fle",
+    CompOpKind.GT: "fgt",
+    CompOpKind.GE: "fge",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,7 +149,7 @@ class HugrTarget:
             CallableDefinitionConflictError: If one source callable produced
                 multiple specialized bodies that cannot share one HUGR symbol.
         """
-        _validate_direct_semantics(program)
+        validate_program_graph_semantics(program)
         for ref, variants in program.definition_variants.items():
             if len(variants) > 1:
                 symbol = f"{ref.namespace}.{ref.name}@{ref.version}"
@@ -159,7 +186,15 @@ class HugrTarget:
             metadata=CompilationMetadata(
                 target=self.name,
                 pipeline="program_graph",
-                properties={"extension_family": "tket"},
+                properties={
+                    "extension_family": "tket",
+                    "runtime_inputs": tuple(
+                        name
+                        for value in _entry_inputs(program.entrypoint, program.bindings)
+                        for name, public in program.abi.public_inputs.items()
+                        if public.uuid == value.uuid
+                    ),
+                },
             ),
         )
 
@@ -180,42 +215,6 @@ class HugrTarget:
                 "HUGR support requires the optional 'hugr' and 'tket-exts' packages."
             ) from error
         validate(artifact.to_bytes())
-
-
-def _validate_direct_semantics(program: PreparedModule) -> None:
-    """Validate target-neutral invariants skipped by direct HUGR lowering.
-
-    Circuit-family planning runs these checks as part of partial evaluation,
-    analysis, and segmentation. HUGR intentionally preserves the prepared
-    program graph, so it invokes only the non-destructive semantic checks
-    here instead of importing the circuit segmentation pipeline. INLINE
-    callables are expanded only in this validation view so formal values are
-    checked with their call-site provenance; emitted HUGR remains hierarchical.
-
-    Args:
-        program (PreparedModule): Prepared entrypoint and callable bodies.
-
-    Raises:
-        ValidationError: If a while condition is not measurement-backed.
-        AffineTypeError: If control flow discards a quantum value.
-    """
-    inline = InlinePass()
-    blocks: list[tuple[Block, Mapping[str, Any]]] = [
-        (inline.run(program.entrypoint), program.bindings)
-    ]
-    blocks.extend(
-        (inline.run(definition.body), {})
-        for definition in program.definitions.values()
-        if definition.body is not None
-        and definition.default_policy is not CallPolicy.INLINE
-    )
-    visited: set[int] = set()
-    for block, bindings in blocks:
-        if id(block) in visited:
-            continue
-        visited.add(id(block))
-        ValidateWhileContractPass().run(block)
-        reject_control_flow_quantum_discard(block.operations, dict(bindings))
 
 
 def _require_hugr() -> tuple[Any, Any, Any, Any, Any]:
@@ -287,7 +286,12 @@ def _lower_module(program: PreparedModule, plan: HugrCompilationPlan) -> Any:
         bindings=program.bindings,
     )
 
-    extensions = [tket_exts.quantum(), tket_exts.rotation(), tket_exts.bool()]
+    extensions = [
+        tket_exts.quantum(),
+        tket_exts.rotation(),
+        tket_exts.bool(),
+        tket_exts.global_phase(),
+    ]
     return Package([module.hugr], extensions)
 
 
@@ -325,8 +329,35 @@ def _entry_inputs(block: Block, bindings: Mapping[str, Any]) -> list[ValueLike]:
     ]
 
 
+def _hugr_uint_type() -> Any:
+    """Return the unsigned integer carrier shared with Quantinuum execution.
+
+    Returns:
+        Any: HUGR integer type with 64 bits.
+    """
+    from hugr.std.int import int_t
+
+    return int_t(6)
+
+
+def _hugr_uint_value(value: int) -> Any:
+    """Encode an integer in the 64-bit HUGR carrier.
+
+    Args:
+        value (int): Integer reduced modulo 2**64.
+
+    Returns:
+        Any: HUGR two's-complement integer constant.
+    """
+    from hugr.std.int import IntVal
+
+    unsigned = value % (1 << 64)
+    signed = unsigned if unsigned < (1 << 63) else unsigned - (1 << 64)
+    return IntVal(signed, width=6)
+
+
 def _lower_type(value_type: ValueType) -> Any:
-    """Map a scalar Qamomile type to its HUGR counterpart.
+    """Map a scalar or packed-register Qamomile type to its HUGR counterpart.
 
     Args:
         value_type (ValueType): Qamomile semantic value type.
@@ -347,10 +378,100 @@ def _lower_type(value_type: ValueType) -> Any:
 
         return FLOAT_T
     if isinstance(value_type, UIntType):
-        from hugr.std.int import INT_T
-
-        return INT_T
+        return _hugr_uint_type()
+    if isinstance(value_type, QUIntType):
+        return tys.Tuple(*[tys.Qubit] * _qint_width(value_type))
     raise EmitError(f"Unsupported HUGR value type: {value_type.label()}")
+
+
+def _qint_width(value_type: QUIntType) -> int:
+    """Resolve a quantum integer width supported by the HUGR UInt carrier.
+
+    Args:
+        value_type (QUIntType): Quantum integer type after semantic preparation.
+
+    Returns:
+        int: Concrete width between zero and 64, inclusive.
+
+    Raises:
+        EmitError: If the width is unresolved or outside the supported range.
+    """
+    width = value_type.width
+    if isinstance(width, Value):
+        if not width.is_constant():
+            raise EmitError("HUGR QInt requires a resolved bit width; supply bindings")
+        width = width.get_const()
+    if type(width) is not int or not 0 <= width <= 64:
+        raise EmitError(
+            f"HUGR QInt supports widths from 0 to 64 bits, got {width!r}; "
+            "the HUGR UInt carrier is 64-bit"
+        )
+    return width
+
+
+def _carrier_element_types(value: ValueLike) -> list[Any]:
+    """Return the element types of a flat array or packed quantum integer.
+
+    Args:
+        value (ValueLike): Array or QInt represented by a list of wires.
+
+    Returns:
+        list[Any]: HUGR element types in carrier order.
+
+    Raises:
+        EmitError: If the carrier type or its width is unsupported.
+    """
+    if isinstance(value, ArrayValue):
+        return [_lower_type(value.type)] * _array_size(value)
+    if isinstance(value.type, QUIntType):
+        _, tys, _, _, _ = _require_hugr()
+        return [tys.Qubit] * _qint_width(value.type)
+    raise EmitError("HUGR flat carrier requires an array or QInt")
+
+
+def _dict_entries(value: DictValue) -> tuple[tuple[ValueLike, ValueLike], ...]:
+    """Materialize the fixed entries of a bound dictionary ABI value.
+
+    Args:
+        value (DictValue): Explicit entries or compile-time bound dictionary.
+
+    Returns:
+        tuple[tuple[ValueLike, ValueLike], ...]: Stable key/value order.
+
+    Raises:
+        EmitError: If a bound payload has no supported classical carrier.
+    """
+    if value.entries:
+        return value.entries
+    return tuple(
+        (_literal_value(key), _literal_value(item))
+        for key, item in value.get_bound_data_items()
+    )
+
+
+def _literal_value(value: Any) -> ValueLike:
+    """Represent a bound dictionary payload as a typed constant.
+
+    Args:
+        value (Any): Boolean, unsigned integer, float, or tuple payload.
+
+    Returns:
+        ValueLike: Typed constant carrier description.
+
+    Raises:
+        EmitError: If the payload is unsupported.
+    """
+    if isinstance(value, tuple):
+        return TupleValue(
+            name="", elements=tuple(_literal_value(item) for item in value)
+        )
+    if isinstance(value, bool):
+        return Value(type=BitType(), name="").with_const(value)
+    if isinstance(value, int):
+        return Value(type=UIntType(), name="").with_const(value)
+    if isinstance(value, float):
+        return Value(type=FloatType(), name="").with_const(value)
+    raise EmitError("HUGR dictionaries require numeric scalar or tuple payloads")
 
 
 def _lower_value_type(value: ValueLike) -> Any:
@@ -362,8 +483,17 @@ def _lower_value_type(value: ValueLike) -> Any:
     Returns:
         Any: Scalar type or fixed-length HUGR tuple type.
     """
-    if isinstance(value, (TupleValue, DictValue)):
-        raise EmitError(f"HUGR structural value {value.name!r} is not supported yet")
+    if isinstance(value, TupleValue):
+        _, tys, _, _, _ = _require_hugr()
+        return tys.Tuple(*[_lower_value_type(item) for item in value.elements])
+    if isinstance(value, DictValue):
+        _, tys, _, _, _ = _require_hugr()
+        return tys.Tuple(
+            *[
+                tys.Tuple(_lower_value_type(key), _lower_value_type(item))
+                for key, item in _dict_entries(value)
+            ]
+        )
     if isinstance(value, ArrayValue):
         _, tys, _, _, _ = _require_hugr()
         return tys.Tuple(*[_lower_type(value.type) for _ in range(_array_size(value))])
@@ -371,7 +501,7 @@ def _lower_value_type(value: ValueLike) -> Any:
 
 
 def _array_size(value: ArrayValue) -> int:
-    """Return a statically known one-dimensional array size.
+    """Return the row-major size of a statically shaped array.
 
     Args:
         value (ArrayValue): Array value to inspect.
@@ -380,12 +510,13 @@ def _array_size(value: ArrayValue) -> int:
         int: Non-negative fixed size.
 
     Raises:
-        EmitError: If shape is missing, dynamic, or multidimensional.
+        EmitError: If any dimension is dynamic or negative.
     """
-    if len(value.shape) != 1 or not value.shape[0].is_constant():
-        raise EmitError(f"HUGR array {value.name!r} requires one static dimension")
-    size = int(value.shape[0].get_const())
-    if size < 0:
+    if not value.shape or any(not dim.is_constant() for dim in value.shape):
+        raise EmitError(f"HUGR array {value.name!r} requires static dimensions")
+    dimensions = [int(dim.get_const()) for dim in value.shape]
+    size = math.prod(dimensions)
+    if any(dim < 0 for dim in dimensions):
         raise EmitError(f"HUGR array {value.name!r} has negative size")
     return size
 
@@ -425,23 +556,15 @@ def _lower_block(
         environment[value.uuid] = resolved
         environment[f"__parameter__:{name}"] = resolved
     for value, wire in zip(inputs, builder.inputs(), strict=True):
-        if isinstance(value, ArrayValue):
-            from hugr import ops
-
-            element_types = [_lower_type(value.type) for _ in range(_array_size(value))]
-            environment[value.uuid] = list(
-                builder.add_op(ops.UnpackTuple(element_types), wire)
-            )
-        else:
-            environment[value.uuid] = wire
-        parameter_name = value.parameter_name()
+        _unpack_input(value, wire, builder, environment)
+        parameter_name = value.parameter_name() if isinstance(value, Value) else None
         if parameter_name is not None:
             environment[f"__parameter__:{parameter_name}"] = environment[value.uuid]
     live_qubits: dict[str, Any] = {}
     for value in inputs:
         if not value.type.is_quantum():
             continue
-        if isinstance(value, ArrayValue):
+        if isinstance(value, ArrayValue) or isinstance(value.type, QUIntType):
             live_qubits.update(
                 {
                     f"{value.uuid}:{index}": wire
@@ -456,19 +579,15 @@ def _lower_block(
 
     outputs = []
     for value in block.output_values:
-        if value.uuid not in environment:
-            raise EmitError(
-                f"HUGR output value {value.name!r} ({value.uuid}) is unresolved"
-            )
         outputs.append(_pack_value(value, environment, builder))
 
     output_qubits: set[str] = set()
     for value in block.output_values:
         if not value.type.is_quantum():
             continue
-        if isinstance(value, ArrayValue):
+        if isinstance(value, ArrayValue) or isinstance(value.type, QUIntType):
             output_qubits.update(
-                f"{value.uuid}:{index}" for index in range(_array_size(value))
+                f"{value.uuid}:{index}" for index in range(len(environment[value.uuid]))
             )
         else:
             output_qubits.add(value.uuid)
@@ -480,12 +599,60 @@ def _lower_block(
     builder.set_outputs(*outputs)
 
 
+def _unpack_input(
+    value: ValueLike, wire: Any, builder: Any, environment: dict[str, Any]
+) -> None:
+    """Expose nested public input leaves in the target environment.
+
+    Args:
+        value (ValueLike): Public ABI value.
+        wire (Any): Native HUGR input carrier.
+        builder (Any): Function builder.
+        environment (dict[str, Any]): UUID-to-wire mapping to populate.
+
+    Raises:
+        EmitError: If a carrier type or its static width is unsupported.
+    """
+    from hugr import ops
+
+    if isinstance(value, ArrayValue) or isinstance(value.type, QUIntType):
+        environment[value.uuid] = list(
+            builder.add_op(ops.UnpackTuple(_carrier_element_types(value)), wire)
+        )
+    elif isinstance(value, TupleValue):
+        children = list(
+            builder.add_op(
+                ops.UnpackTuple([_lower_value_type(item) for item in value.elements]),
+                wire,
+            )
+        )
+        for item, child in zip(value.elements, children, strict=True):
+            _unpack_input(item, child, builder, environment)
+        environment[value.uuid] = wire
+    elif isinstance(value, DictValue):
+        _, tys, _, _, _ = _require_hugr()
+        pair_types = [
+            tys.Tuple(_lower_value_type(key), _lower_value_type(item))
+            for key, item in _dict_entries(value)
+        ]
+        pairs = list(builder.add_op(ops.UnpackTuple(pair_types), wire))
+        for (key, item), pair in zip(_dict_entries(value), pairs, strict=True):
+            left, right = builder.add_op(
+                ops.UnpackTuple([_lower_value_type(key), _lower_value_type(item)]), pair
+            )
+            _unpack_input(key, left, builder, environment)
+            _unpack_input(item, right, builder, environment)
+        environment[value.uuid] = wire
+    else:
+        environment[value.uuid] = wire
+
+
 def _pack_value(
     value: ValueLike,
     environment: dict[str, Any],
     builder: Any,
 ) -> Any:
-    """Return a scalar wire or pack array elements into a HUGR tuple.
+    """Return a scalar wire or pack structured values into a HUGR tuple.
 
     Args:
         value (ValueLike): Value to materialize at a function boundary.
@@ -496,19 +663,44 @@ def _pack_value(
         Any: Scalar or tuple wire.
 
     Raises:
-        EmitError: If the value is unresolved.
+        EmitError: If the value is unresolved or its carrier type or width is
+            unsupported.
     """
-    if isinstance(value, (TupleValue, DictValue)):
-        raise EmitError(f"HUGR structural value {value.name!r} is not supported yet")
+    from hugr import ops
+
+    if isinstance(value, TupleValue):
+        elements = [_pack_value(item, environment, builder) for item in value.elements]
+        [packed] = builder.add_op(
+            ops.MakeTuple([_lower_value_type(item) for item in value.elements]),
+            *elements,
+        )
+        return packed
+    if isinstance(value, DictValue):
+        pairs = []
+        pair_types = []
+        for key, item in _dict_entries(value):
+            types = [_lower_value_type(key), _lower_value_type(item)]
+            [pair] = builder.add_op(
+                ops.MakeTuple(types),
+                _pack_value(key, environment, builder),
+                _pack_value(item, environment, builder),
+            )
+            pairs.append(pair)
+            _, tys, _, _, _ = _require_hugr()
+            pair_types.append(tys.Tuple(*types))
+        [packed] = builder.add_op(ops.MakeTuple(pair_types), *pairs)
+        return packed
+    if value.uuid not in environment and not isinstance(value, ArrayValue):
+        return _resolve_classical_argument(value, builder, environment)
     try:
         resolved = environment[value.uuid]
     except KeyError as error:
         raise EmitError(f"Unresolved HUGR value {value.name!r}") from error
-    if not isinstance(value, ArrayValue):
+    if not isinstance(value, ArrayValue) and not isinstance(value.type, QUIntType):
         return resolved
     from hugr import ops
 
-    element_types = [_lower_type(value.type) for _ in range(_array_size(value))]
+    element_types = _carrier_element_types(value)
     [packed] = builder.add_op(ops.MakeTuple(element_types), *resolved)
     return packed
 
@@ -539,10 +731,18 @@ def _lower_operation(
             _lower_qinit(operation, builder, environment, live_qubits)
         case GateOperation():
             _lower_gate(operation, builder, environment, live_qubits)
+        case GlobalPhaseOperation():
+            _lower_global_phase(operation.phase, builder, environment)
         case ControlledUOperation() | InverseBlockOperation():
             _lower_transformed_call(
                 operation, builder, environment, live_qubits, functions
             )
+        case MeasureQFixedOperation():
+            _lower_measure_qfixed(operation, builder, environment, live_qubits)
+        case MeasureQIntOperation():
+            _lower_measure_qint(operation, builder, environment, live_qubits)
+        case CastOperation():
+            _lower_cast(operation, environment, live_qubits)
         case MeasureOperation() | MeasureVectorOperation():
             _lower_measure(operation, builder, environment, live_qubits)
         case ProjectOperation():
@@ -568,14 +768,55 @@ def _lower_operation(
 
             [result] = builder.add(Not(environment[operation.operands[0].uuid]))
             environment[operation.results[0].uuid] = result
+        case SliceArrayOperation():
+            _lower_slice(operation, environment)
+        case ReleaseSliceViewOperation():
+            _lower_slice(operation, environment)
         case ReturnOperation():
             return
+        case SelectOperation():
+            _lower_select(operation, builder, environment, live_qubits)
         case _:
             raise EmitError(
                 f"Unsupported direct HUGR lowering for "
                 f"{type(operation).__name__}. Circuit segmentation is "
                 f"intentionally not used for this target."
             )
+
+
+def _lower_slice(
+    operation: SliceArrayOperation | ReleaseSliceViewOperation,
+    environment: dict[str, Any],
+) -> None:
+    """Alias a static borrow or publish its current wires back to the root.
+
+    Args:
+        operation (SliceArrayOperation | ReleaseSliceViewOperation): Borrow marker.
+        environment (dict[str, Any]): Root arrays and scalar wires.
+
+    Raises:
+        EmitError: If the view or its physical root cannot be resolved.
+    """
+    release = isinstance(operation, ReleaseSliceViewOperation)
+    values = operation.operands if release else operation.results
+    if len(values) != 1 or not isinstance(values[0], ArrayValue):
+        raise EmitError("HUGR slice requires one fixed-size array view")
+    view = values[0]
+    wires = []
+    for index in range(_array_size(view)):
+        address = resolve_root_array_index(view, index)
+        if address is None:
+            raise EmitError("HUGR slices require static physical indices")
+        root, physical = address
+        try:
+            if release:
+                environment[root.uuid][physical] = environment[view.uuid][index]
+            else:
+                wires.append(environment[root.uuid][physical])
+        except (KeyError, IndexError, TypeError) as error:
+            raise EmitError("HUGR slice has an unresolved physical root") from error
+    if not release:
+        environment[view.uuid] = wires
 
 
 def _lower_for(
@@ -647,9 +888,7 @@ def _lower_for(
     for index in range(start, stop, step):
         incoming_keys = set(live_qubits)
         if operation.loop_var_value is not None:
-            from hugr.std.int import IntVal
-
-            [loop_wire] = builder.load(IntVal(index))
+            [loop_wire] = builder.load(_hugr_uint_value(index))
             environment[operation.loop_var_value.uuid] = loop_wire
             environment[f"__index__:{operation.loop_var_value.uuid}"] = index
         environment.update(carried)
@@ -729,11 +968,13 @@ def _lower_runtime_for(
     index_wire, current_stop = loop_inputs[:2]
 
     from hugr import ops, tys
-    from hugr.std.int import INT_OPS_EXTENSION, INT_T, IntVal
+    from hugr.std.int import INT_OPS_EXTENSION
+
+    INT_T = _hugr_uint_type()
 
     comparison_name = "ilt_u" if step_value > 0 else "igt_u"
     comparison = INT_OPS_EXTENSION.get_op(comparison_name).instantiate(
-        [tys.BoundedNatArg(5)],
+        [tys.BoundedNatArg(6)],
         concrete_signature=tys.FunctionType([INT_T, INT_T], [tys.Bool]),
     )
     [condition] = loop.add_op(comparison, index_wire, current_stop)
@@ -757,7 +998,14 @@ def _lower_runtime_for(
     if operation.loop_var_value is not None:
         branch_environment[operation.loop_var_value.uuid] = branch_index
     branch_live = dict(live_qubits)
-    branch_incoming_keys = set(branch_live)
+    branch_parent_keys = set(branch_live)
+    branch_region_keys = _rebind_captured_live_wires(
+        captured_ids,
+        environment,
+        branch_environment,
+        branch_live,
+    )
+    branch_protected_keys = branch_parent_keys - branch_region_keys
     for nested in operation.operations:
         _lower_operation(
             nested,
@@ -767,9 +1015,9 @@ def _lower_runtime_for(
             functions,
         )
 
-    [step_wire] = branch.load(IntVal(step_value))
+    [step_wire] = branch.load(_hugr_uint_value(step_value))
     addition = INT_OPS_EXTENSION.get_op("iadd").instantiate(
-        [tys.BoundedNatArg(5)],
+        [tys.BoundedNatArg(6)],
         concrete_signature=tys.FunctionType([INT_T, INT_T], [INT_T]),
     )
     [next_index] = branch.add_op(addition, branch_index, step_wire)
@@ -783,7 +1031,7 @@ def _lower_runtime_for(
     _free_region_local_qubits(
         branch,
         branch_live,
-        branch_incoming_keys,
+        branch_protected_keys,
         [*next_captured, *next_region_args],
     )
     branch.set_outputs(
@@ -840,9 +1088,7 @@ def _integer_value_wire(
         EmitError: If a runtime value is unresolved.
     """
     if value.is_constant():
-        from hugr.std.int import IntVal
-
-        [wire] = builder.load(IntVal(int(value.get_const())))
+        [wire] = builder.load(_hugr_uint_value(int(value.get_const())))
         return wire
     try:
         return environment[value.uuid]
@@ -863,13 +1109,7 @@ def _for_capture_ids(
     Returns:
         list[str]: Stable UUID order for captured values.
     """
-    # A loop-invariant overwrite can yield an outer value without any body
-    # operation reading it. It still crosses the TailLoop boundary.
-    return _region_capture_ids(
-        operation.operations,
-        environment,
-        extra_values=[region.yielded for region in operation.region_args],
-    )
+    return _capture_environment_ids(operation.captures, environment)
 
 
 def _lower_if(
@@ -889,8 +1129,45 @@ def _lower_if(
         functions (dict[CallableRef, Any]): Predeclared HUGR functions.
 
     Raises:
-        EmitError: If a branch yield is unresolved.
+        EmitError: If a branch yield is unresolved or a runtime branch merges
+            a packed QInt register.
     """
+    specialized = lower_compile_time_ifs_preserving_loop_conditions(
+        Block(operations=[operation], output_values=list(operation.results)),
+        {
+            key.removeprefix("__index__:"): value
+            for key, value in environment.items()
+            if key.startswith("__index__:")
+        },
+    )
+    unresolved = any(
+        isinstance(nested, IfOperation) and nested.condition == operation.condition
+        for nested in specialized.operations
+    )
+    if not unresolved:
+        for nested in specialized.operations:
+            _lower_operation(nested, builder, environment, live_qubits, functions)
+        for result, selected in zip(
+            operation.results, specialized.output_values, strict=True
+        ):
+            if result.type.is_quantum():
+                _publish_transformed_result(
+                    cast(Value, selected),
+                    result,
+                    _resolve_wire(cast(Value, selected), environment),
+                    environment,
+                    live_qubits,
+                )
+            else:
+                environment[result.uuid] = _resolve_classical_argument(
+                    cast(Value, selected), builder, environment
+                )
+        return
+    if any(isinstance(value.type, QUIntType) for value in operation.results):
+        raise EmitError(
+            "HUGR runtime conditionals do not support QInt register merges",
+            operation="IfOperation",
+        )
     condition = _resolve_wire(operation.condition, environment)
     captured_ids = _branch_capture_ids(operation, environment)
     true_origins = _quantum_origins(operation.true_operations, captured_ids)
@@ -909,13 +1186,14 @@ def _lower_if(
         true_environment,
     )
     true_live = dict(live_qubits)
-    _rebind_captured_live_wires(
+    true_parent_keys = set(true_live)
+    true_region_keys = _rebind_captured_live_wires(
         captured_ids,
         environment,
         true_environment,
         true_live,
     )
-    true_incoming_keys = set(true_live)
+    true_protected_keys = true_parent_keys - true_region_keys
     for nested in operation.true_operations:
         _lower_operation(
             nested,
@@ -936,7 +1214,7 @@ def _lower_if(
     _free_region_local_qubits(
         true_builder,
         true_live,
-        true_incoming_keys,
+        true_protected_keys,
         true_outputs,
     )
     true_builder.set_outputs(*true_outputs)
@@ -949,13 +1227,14 @@ def _lower_if(
         false_environment,
     )
     false_live = dict(live_qubits)
-    _rebind_captured_live_wires(
+    false_parent_keys = set(false_live)
+    false_region_keys = _rebind_captured_live_wires(
         captured_ids,
         environment,
         false_environment,
         false_live,
     )
-    false_incoming_keys = set(false_live)
+    false_protected_keys = false_parent_keys - false_region_keys
     for nested in operation.false_operations:
         _lower_operation(
             nested,
@@ -976,7 +1255,7 @@ def _lower_if(
     _free_region_local_qubits(
         false_builder,
         false_live,
-        false_incoming_keys,
+        false_protected_keys,
         false_outputs,
     )
     false_builder.set_outputs(*false_outputs)
@@ -988,8 +1267,9 @@ def _lower_if(
     outputs = [
         true_builder.conditional_node.out(index) for index in range(output_count)
     ]
-    for uuid in captured_ids:
-        live_qubits.pop(uuid, None)
+    for key, wire in list(live_qubits.items()):
+        if any(wire == captured_wire for captured_wire in captured):
+            live_qubits.pop(key)
     output_index = 0
     for merge in operation.iter_merges():
         width = _array_size(merge.result) if isinstance(merge.result, ArrayValue) else 1
@@ -1331,6 +1611,7 @@ def _quantum_origins(
             quantum_results = [
                 value for value in operation.results if value.type.is_quantum()
             ]
+            parent_array_origins: dict[str, _QuantumOrigin | None] = {}
             for index, result in enumerate(quantum_results):
                 operand = next(
                     (
@@ -1351,6 +1632,18 @@ def _quantum_origins(
                 origin = _value_quantum_origin(operand, current)
                 if origin is not None:
                     current[result.uuid] = origin
+                    address = resolve_root_qubit_address(result)
+                    if address is None:
+                        continue
+                    result_root, result_index = address
+                    candidate = (origin[0], None) if origin[1] == result_index else None
+                    if result_root not in parent_array_origins:
+                        parent_array_origins[result_root] = candidate
+                    elif parent_array_origins[result_root] != candidate:
+                        parent_array_origins[result_root] = None
+            for result_root, origin in parent_array_origins.items():
+                if origin is not None:
+                    current[result_root] = origin
         return current
 
     return trace_region(operations, {uuid: (uuid, None) for uuid in input_ids})
@@ -1412,12 +1705,33 @@ def _lower_while(
         functions (dict[CallableRef, Any]): Predeclared HUGR functions.
 
     Raises:
-        EmitError: If the condition or a captured body value is unresolved.
+        EmitError: If the condition or a captured body value is unresolved,
+            or if a region argument is array-valued.
     """
     try:
         validate_region_args(operation)
     except ValueError as error:
         raise EmitError(str(error), operation="WhileOperation") from error
+    array_region_args = [
+        region.var_name
+        for region in operation.region_args
+        if any(
+            isinstance(value, ArrayValue)
+            for value in (
+                region.init,
+                region.block_arg,
+                region.yielded,
+                region.result,
+            )
+        )
+    ]
+    if array_region_args:
+        raise EmitError(
+            "HUGR while loops do not support array-valued region arguments "
+            f"({', '.join(array_region_args)}); array state must be flattened "
+            "across TailLoop ports before lowering.",
+            operation="WhileOperation",
+        )
     quantum_rebinds = _unsupported_quantum_rebinds(operation)
     unsupported_rebinds = []
     for rebind in operation.loop_carried_rebinds:
@@ -1437,9 +1751,8 @@ def _lower_while(
             f"while loop without explicit linear region slots ({names}).",
             operation="WhileOperation",
         )
-    if operation.region_args or unsupported_rebinds:
-        names = [region.var_name for region in operation.region_args]
-        names.extend(rebind.var_name for rebind in unsupported_rebinds)
+    if unsupported_rebinds:
+        names = [rebind.var_name for rebind in unsupported_rebinds]
         raise EmitError(
             "HUGR cannot lower loop-carried classical values in a while loop "
             f"without explicit region arguments ({', '.join(names)}).",
@@ -1453,20 +1766,52 @@ def _lower_while(
     captured_ids = _loop_capture_ids(operation, environment)
     captured_wires = _flatten_environment_values(captured_ids, environment)
     captured_width = len(captured_wires)
-    loop = builder.add_tail_loop([], [condition_wire, *captured_wires])
+    region_init_wires = [
+        _resolve_classical_argument(region.init, builder, environment)
+        for region in operation.region_args
+    ]
+    loop = builder.add_tail_loop(
+        [],
+        [condition_wire, *captured_wires, *region_init_wires],
+    )
     loop_inputs = loop.inputs()
-    current_condition, *current_captured = loop_inputs
+    current_condition, *current_state = loop_inputs
+    current_captured = current_state[:captured_width]
+    current_region_args = current_state[captured_width:]
     loop_environment = dict(environment)
     loop_environment[condition.uuid] = current_condition
     _bind_region_inputs(captured_ids, current_captured, loop_environment)
+    loop_environment.update(
+        zip(
+            (region.block_arg.uuid for region in operation.region_args),
+            current_region_args,
+            strict=True,
+        )
+    )
 
     branch = loop.add_if(current_condition, *loop_inputs)
-    branch_condition, *branch_captured = branch.inputs()
+    branch_condition, *branch_state = branch.inputs()
+    branch_captured = branch_state[:captured_width]
+    branch_region_args = branch_state[captured_width:]
     true_environment = dict(loop_environment)
     true_environment[condition.uuid] = branch_condition
     _bind_region_inputs(captured_ids, branch_captured, true_environment)
+    true_environment.update(
+        zip(
+            (region.block_arg.uuid for region in operation.region_args),
+            branch_region_args,
+            strict=True,
+        )
+    )
     true_live = dict(live_qubits)
-    true_incoming_keys = set(true_live)
+    true_parent_keys = set(true_live)
+    true_region_keys = _rebind_captured_live_wires(
+        captured_ids,
+        environment,
+        true_environment,
+        true_live,
+    )
+    true_protected_keys = true_parent_keys - true_region_keys
     for nested in operation.operations:
         _lower_operation(nested, branch, true_environment, true_live, functions)
 
@@ -1479,17 +1824,29 @@ def _lower_while(
 
     control_type = tys.Sum([[], []])
     [continue_wire] = branch.add_op(ops.Tag(0, control_type))
+    _validate_live_quantum_yields(
+        [value for value in operation.captures if isinstance(value, Value)],
+        true_environment,
+        true_live,
+        "while",
+        operation_name="WhileOperation",
+    )
     next_captured = _flatten_environment_values(captured_ids, true_environment)
+    next_region_args = [
+        _resolve_classical_argument(region.yielded, branch, true_environment)
+        for region in operation.region_args
+    ]
     _free_region_local_qubits(
         branch,
         true_live,
-        true_incoming_keys,
-        next_captured,
+        true_protected_keys,
+        [*next_captured, *next_region_args],
     )
     branch.set_outputs(
         continue_wire,
         next_condition,
         *next_captured,
+        *next_region_args,
     )
 
     false_branch = branch.add_else()
@@ -1497,11 +1854,16 @@ def _lower_while(
     false_branch.set_outputs(break_wire, *false_branch.inputs())
 
     conditional_outputs = [
-        branch.conditional_node.out(index) for index in range(2 + captured_width)
+        branch.conditional_node.out(index)
+        for index in range(2 + captured_width + len(operation.region_args))
     ]
     loop.set_loop_outputs(*conditional_outputs)
-    loop_outputs = [loop.parent_node.out(index) for index in range(1 + captured_width)]
-    final_condition, *capture_outputs = loop_outputs
+    loop_outputs = [
+        loop.parent_node.out(index)
+        for index in range(1 + captured_width + len(operation.region_args))
+    ]
+    final_condition, *final_state = loop_outputs
+    capture_outputs = final_state[:captured_width]
     origins = _quantum_origins(operation.operations, captured_ids)
     _publish_captured_outputs(
         captured_ids,
@@ -1512,6 +1874,9 @@ def _lower_while(
     )
     if len(operation.operands) > 1:
         environment[operation.operands[1].uuid] = final_condition
+    region_outputs = final_state[captured_width:]
+    for region, wire in zip(operation.region_args, region_outputs, strict=True):
+        environment[region.result.uuid] = wire
 
 
 def _loop_capture_ids(
@@ -1527,8 +1892,8 @@ def _loop_capture_ids(
     Returns:
         list[str]: Stable UUID order for TailLoop carried values.
     """
-    return _region_capture_ids(
-        operation.operations,
+    return _capture_environment_ids(
+        operation.captures,
         environment,
         excluded={operation.operands[0].uuid},
     )
@@ -1547,136 +1912,66 @@ def _branch_capture_ids(
     Returns:
         list[str]: Stable UUID order for HUGR conditional inputs.
     """
-    operations = [*operation.true_operations, *operation.false_operations]
-    yields = [*operation.true_yields, *operation.false_yields]
-    return _region_capture_ids(
-        operations,
-        environment,
-        extra_values=yields,
-        excluded={operation.condition.uuid},
-    )
+    captures = [*operation.true_captures, *operation.false_captures]
+    return _capture_environment_ids(captures, environment)
 
 
-def _region_capture_ids(
-    operations: list[Operation],
+def _capture_environment_ids(
+    captures: list[ValueBase] | tuple[ValueBase, ...],
     environment: dict[str, Any],
-    extra_values: list[Value] | None = None,
     excluded: set[str] | None = None,
 ) -> list[str]:
-    """Collect stable, deduplicated captures for one nested HUGR region.
+    """Resolve declared semantic captures to parent-environment entries.
 
     Args:
-        operations (list[Operation]): Region operations to inspect recursively.
+        captures (list[ValueBase] | tuple[ValueBase, ...]): Explicit region
+            captures in semantic first-use order.
         environment (dict[str, Any]): Available parent-region wires.
-        extra_values (list[Value] | None): Region yields that cross the
-            boundary without an operation read. Defaults to ``None``.
         excluded (set[str] | None): UUIDs carried by dedicated region state
             rather than generic captures. Defaults to ``None``.
 
     Returns:
-        list[str]: Captured UUIDs in parent-environment order.
+        list[str]: Environment UUIDs in declared capture order, with array
+            elements collapsed to an available root carrier.
+
+    Raises:
+        EmitError: If a non-constant declared capture has no parent-region
+            environment entry.
     """
-    captured: set[str] = set()
-    for nested in operations:
-        captured.update(_captured_operand_ids(nested, environment))
-    extras = extra_values or []
-    for value in extras:
-        if value.uuid in environment:
-            captured.add(value.uuid)
+    result: list[str] = []
+    seen: set[str] = set()
+    excluded_ids = excluded or set()
+    declared_ids = {value.uuid for value in captures}
+    for value in captures:
+        if value.uuid in excluded_ids or value.is_constant():
             continue
-        root_uuid = _array_root_uuid(value)
-        if root_uuid is not None and root_uuid in environment:
-            captured.add(root_uuid)
-    _deduplicate_quantum_capture_ids(
-        operations,
-        captured,
-        extras,
-    )
-    captured.difference_update(excluded or ())
-    return [uuid for uuid in environment if uuid in captured]
-
-
-def _captured_operand_ids(
-    operation: Operation,
-    environment: dict[str, Any],
-) -> set[str]:
-    """Collect parent-environment operands used by an operation tree.
-
-    Args:
-        operation (Operation): Root operation to inspect recursively.
-        environment (dict[str, Any]): Available parent-region values.
-
-    Returns:
-        set[str]: UUIDs captured from the parent environment.
-    """
-    captured: set[str] = set()
-    for value in operation.all_input_values():
-        if value.uuid in environment:
-            captured.add(value.uuid)
-            continue
-        if not isinstance(value, Value):
-            continue
-        root_uuid = _array_root_uuid(value)
-        if root_uuid is not None and root_uuid in environment:
-            captured.add(root_uuid)
-    nested_lists = getattr(operation, "nested_op_lists", None)
-    if callable(nested_lists):
-        for nested_operations in nested_lists():
-            for nested in nested_operations:
-                captured.update(_captured_operand_ids(nested, environment))
-    return captured
-
-
-def _deduplicate_quantum_capture_ids(
-    operations: list[Operation],
-    captured: set[str],
-    extra_values: list[Value] | None = None,
-) -> None:
-    """Drop scalar element captures already covered by a captured root array.
-
-    Args:
-        operations (list[Operation]): Region operations whose values identify
-            array-element aliases.
-        captured (set[str]): Mutable set of captured environment UUIDs.
-        extra_values (list[Value] | None): Structural region yields not owned
-            by an operation. Defaults to ``None``.
-    """
-
-    def visit_value(value: ValueBase) -> None:
-        """Discard a captured element already represented by its root array.
-
-        Args:
-            value (ValueBase): Candidate quantum value to deduplicate.
-        """
-        if not isinstance(value, Value) or not value.type.is_quantum():
-            return
-        root_uuid = _array_root_uuid(value)
-        if (
-            root_uuid is not None
-            and root_uuid != value.uuid
-            and root_uuid in captured
-            and value.uuid in captured
-        ):
-            captured.discard(value.uuid)
-
-    def visit_operations(nested_operations: list[Operation]) -> None:
-        """Visit every input value in a nested operation tree.
-
-        Args:
-            nested_operations (list[Operation]): Operations to inspect
-                recursively.
-        """
-        for operation in nested_operations:
-            for value in operation.all_input_values():
-                visit_value(value)
-            nested_lists = getattr(operation, "nested_op_lists", None)
-            if callable(nested_lists):
-                for body in nested_lists():
-                    visit_operations(body)
-
-    visit_operations(operations)
-    for value in extra_values or ():
-        visit_value(value)
+        environment_id = value.uuid if value.uuid in environment else None
+        if isinstance(value, Value):
+            root_uuid = _array_root_uuid(value)
+            if (
+                root_uuid is not None
+                and root_uuid in environment
+                and root_uuid in declared_ids
+            ):
+                # A whole-array capture subsumes element aliases of the same
+                # linear resource. Resolve them all to the root even when the
+                # element appears first in semantic capture order.
+                environment_id = root_uuid
+            elif (
+                environment_id is None
+                and root_uuid is not None
+                and root_uuid in environment
+            ):
+                environment_id = root_uuid
+        if environment_id is None:
+            raise EmitError(
+                "Explicit region capture is unavailable in the parent HUGR "
+                f"environment ({value.name or value.uuid})."
+            )
+        if environment_id not in seen:
+            result.append(environment_id)
+            seen.add(environment_id)
+    return result
 
 
 def _flatten_environment_values(
@@ -1702,7 +1997,7 @@ def _flatten_environment_values(
 def _free_region_local_qubits(
     builder: Any,
     live_qubits: dict[str, Any],
-    incoming_keys: set[str],
+    protected_parent_keys: set[str],
     output_wires: list[Any],
 ) -> None:
     """Free live quantum wires created in a nested region but not yielded.
@@ -1710,17 +2005,19 @@ def _free_region_local_qubits(
     Args:
         builder (Any): HUGR region builder receiving ``qFree`` operations.
         live_qubits (dict[str, Any]): Region-local live-resource mapping.
-        incoming_keys (set[str]): Live-resource keys inherited from the parent
-            before lowering the region body.
+        protected_parent_keys (set[str]): Parent-owned live-resource keys that
+            did not cross into this region and therefore cannot be freed here.
         output_wires (list[Any]): Region outputs that must remain live.
     """
     from tket_exts import quantum
 
     protected = list(output_wires)
-    protected.extend(wire for key, wire in live_qubits.items() if key in incoming_keys)
+    protected.extend(
+        wire for key, wire in live_qubits.items() if key in protected_parent_keys
+    )
     freed: list[Any] = []
     for key, wire in list(live_qubits.items()):
-        if key in incoming_keys or any(wire == output for output in protected):
+        if key in protected_parent_keys or any(wire == output for output in protected):
             continue
         live_qubits.pop(key)
         if any(wire == previous for previous in freed):
@@ -1764,7 +2061,7 @@ def _rebind_captured_live_wires(
     parent_environment: dict[str, Any],
     region_environment: dict[str, Any],
     live_qubits: dict[str, Any],
-) -> None:
+) -> set[str]:
     """Point region live-resource entries at their conditional input wires.
 
     ``live_qubits`` is copied from the parent so its keys retain semantic
@@ -1778,9 +2075,13 @@ def _rebind_captured_live_wires(
         parent_environment (dict[str, Any]): Parent UUID-to-wire mapping.
         region_environment (dict[str, Any]): Region mapping after input binding.
         live_qubits (dict[str, Any]): Mutable region live-resource mapping.
+
+    Returns:
+        set[str]: Live-resource keys rebound to region-owned input wires.
     """
     parent_wires = _flatten_environment_values(value_ids, parent_environment)
     region_wires = _flatten_environment_values(value_ids, region_environment)
+    rebound_keys: set[str] = set()
     for key, candidate in list(live_qubits.items()):
         for parent_wire, region_wire in zip(
             parent_wires,
@@ -1789,7 +2090,9 @@ def _rebind_captured_live_wires(
         ):
             if candidate == parent_wire:
                 live_qubits[key] = region_wire
+                rebound_keys.add(key)
                 break
+    return rebound_keys
 
 
 def _validate_live_quantum_yields(
@@ -1797,6 +2100,8 @@ def _validate_live_quantum_yields(
     environment: dict[str, Any],
     live_qubits: dict[str, Any],
     branch: str,
+    *,
+    operation_name: str = "IfOperation",
 ) -> None:
     """Reject branch yields that reuse a destructively consumed qubit.
 
@@ -1811,6 +2116,8 @@ def _validate_live_quantum_yields(
         environment (dict[str, Any]): Region UUID-to-wire mapping.
         live_qubits (dict[str, Any]): Live quantum wires after branch lowering.
         branch (str): Branch name used in the diagnostic.
+        operation_name (str): Semantic operation used in diagnostics. Defaults
+            to ``"IfOperation"``.
 
     Raises:
         EmitError: If a quantum yield no longer denotes a live branch wire.
@@ -1823,10 +2130,9 @@ def _validate_live_quantum_yields(
     ):
         return
     raise EmitError(
-        "HUGR conditional cannot yield a quantum resource after it was "
-        f"destructively consumed in the {branch} branch; partial-array "
-        "quantum merges require liveness-aware lowering",
-        operation="IfOperation",
+        f"HUGR {operation_name} cannot yield a quantum resource after it was "
+        f"destructively consumed in the {branch} region",
+        operation=operation_name,
     )
 
 
@@ -1927,7 +2233,11 @@ def _replace_environment_aliases(
     if isinstance(replacement, list):
         raise EmitError("HUGR loop capture changed scalar width")
     for alias, candidate in list(environment.items()):
-        if not isinstance(candidate, list) and candidate == previous:
+        if isinstance(candidate, list):
+            for index, wire in enumerate(candidate):
+                if wire == previous:
+                    candidate[index] = replacement
+        elif candidate == previous:
             environment[alias] = replacement
 
 
@@ -2001,7 +2311,36 @@ def _lower_cinit(
         if result.uuid in environment:
             continue
         if isinstance(result, ArrayValue):
-            raise EmitError("HUGR array initialization is not implemented yet")
+            concrete = result.get_const_array()
+            if concrete is not None:
+                import numpy as np
+
+                flat = np.asarray(concrete).reshape(-1)
+                if len(flat) != _array_size(result):
+                    raise EmitError("HUGR array initializer disagrees with its shape")
+                environment[result.uuid] = [
+                    builder.load(
+                        _constant_value(
+                            Value(type=result.type, name=result.name).with_const(
+                                item.item()
+                            )
+                        )
+                    )[0]
+                    for item in flat
+                ]
+                continue
+            elements = result.get_element_uuids()
+            if elements and len(elements) == _array_size(result):
+                try:
+                    environment[result.uuid] = [environment[uuid] for uuid in elements]
+                except KeyError as error:
+                    raise EmitError(
+                        "HUGR array initializer has an unresolved element"
+                    ) from error
+                continue
+            raise EmitError(
+                "HUGR array initializer requires concrete or computed elements"
+            )
         if not result.is_constant():
             raise EmitError(f"Unresolved HUGR classical value {result.name!r}")
         [wire] = builder.load(_constant_value(result))
@@ -2030,11 +2369,15 @@ def _constant_value(value: Value) -> Any:
         from hugr.std.float import FloatVal
 
         assert concrete is not None
-        return FloatVal(float(concrete))
+        number = float(concrete)
+        if not math.isfinite(number):
+            raise EmitError("HUGR Float constants must be finite")
+        return FloatVal(number)
     if isinstance(value.type, UIntType):
-        from hugr.std.int import IntVal
-
-        return IntVal(int(concrete))
+        integer = int(concrete)
+        if not 0 <= integer < (1 << 64):
+            raise EmitError("HUGR UInt constants must be in [0, 2**64)")
+        return _hugr_uint_value(integer)
     raise EmitError(f"Unsupported HUGR constant type: {value.type.label()}")
 
 
@@ -2122,6 +2465,8 @@ def _resolve_classical_argument(
         EmitError: If the argument has no constant, UUID, or parameter-name
             resolution.
     """
+    if isinstance(value, (TupleValue, DictValue)):
+        return _pack_value(value, environment, builder)
     if value.uuid in environment:
         return environment[value.uuid]
     address = _array_address(value, environment)
@@ -2157,6 +2502,26 @@ def _array_address(
     Returns:
         tuple[str, int] | None: Root array UUID and element index.
     """
+    if value.parent_array is not None and len(value.element_indices) > 1:
+        array = value.parent_array
+        if len(value.element_indices) != len(array.shape):
+            return None
+        flat = 0
+        for index_value, dimension in zip(
+            value.element_indices, array.shape, strict=True
+        ):
+            index = (
+                index_value.get_const()
+                if index_value.is_constant()
+                else environment.get(f"__index__:{index_value.uuid}")
+            )
+            if not isinstance(index, int) or not dimension.is_constant():
+                return None
+            size = int(dimension.get_const())
+            if index < 0 or index >= size:
+                raise EmitError("HUGR array index is outside its declared dimension")
+            flat = flat * size + index
+        return array.uuid, flat
     address = resolve_root_qubit_address(value)
     if address is not None:
         return address
@@ -2232,8 +2597,9 @@ def _replace_quantum_results(
     if len(results) != len(wires):
         raise EmitError("HUGR quantum result arity mismatch")
     previous_wires = [_resolve_wire(operand, environment) for operand in operands]
-    for operand in operands:
-        live_qubits.pop(_quantum_key(operand, environment), None)
+    for key, wire in list(live_qubits.items()):
+        if any(wire == previous for previous in previous_wires):
+            live_qubits.pop(key)
     for operand, result, wire in zip(operands, results, wires, strict=True):
         environment[result.uuid] = wire
         key = _quantum_key(result, environment)
@@ -2241,15 +2607,21 @@ def _replace_quantum_results(
         address = _array_address(result, environment)
         if address is not None:
             root_uuid, index = address
+            if root_uuid not in environment:
+                source_address = _array_address(operand, environment)
+                if source_address is None or source_address[0] not in environment:
+                    raise EmitError(
+                        f"Cannot reconstruct HUGR array result {result.name!r}"
+                    )
+                environment[root_uuid] = list(environment[source_address[0]])
             environment[root_uuid][index] = wire
-    # Static loop bodies are traced once and therefore reuse their operand
-    # UUIDs on every unrolled iteration. Keep those identities pointed at the
-    # current linear wire after consumption.
+    # Static loop bodies reuse operand UUIDs, and reconstructed array versions
+    # can coexist with their captured root aliases. Advance every identity that
+    # carries the consumed physical wire so later operations and region outputs
+    # cannot reconnect a stale linear wire.
     for operand, wire, previous in zip(operands, wires, previous_wires, strict=True):
+        _replace_environment_aliases(environment, previous, wire)
         if operand.parent_array is None:
-            for uuid, candidate in list(environment.items()):
-                if not isinstance(candidate, list) and candidate == previous:
-                    environment[uuid] = wire
             environment[operand.uuid] = wire
 
 
@@ -2343,7 +2715,6 @@ def _lower_gate(
         GateOperationType.RX,
         GateOperationType.RY,
         GateOperationType.RZ,
-        GateOperationType.P,
     }:
         assert operation.theta is not None
         rotation = _rotation_wire(
@@ -2356,9 +2727,17 @@ def _lower_gate(
             GateOperationType.RX: quantum.Rx,
             GateOperationType.RY: quantum.Ry,
             GateOperationType.RZ: quantum.Rz,
-            GateOperationType.P: quantum.Rz,
         }[gate_type]
         outputs = list(builder.add_op(rotation_op, qubits[0], rotation))
+    elif gate_type is GateOperationType.P:
+        assert operation.theta is not None
+        outputs = _lower_phase_on_controls(
+            operation.theta,
+            builder,
+            environment,
+            qubits,
+            direction=-1.0 if inverse else 1.0,
+        )
     elif gate_type is GateOperationType.SWAP:
         left, right = qubits
         left, right = builder.add_op(quantum.CX, left, right)
@@ -2379,23 +2758,13 @@ def _lower_gate(
         outputs = [left, right]
     elif gate_type is GateOperationType.CP:
         assert operation.theta is not None
-        control, target = qubits
-        direction = -1.0 if inverse else 1.0
-        half = _rotation_wire(
-            builder,
+        outputs = _lower_phase_on_controls(
             operation.theta,
-            environment,
-            scale=0.5 * direction,
-        )
-        [control] = builder.add_op(quantum.Rz, control, half)
-        full = _rotation_wire(
             builder,
-            operation.theta,
             environment,
-            scale=direction,
+            qubits,
+            direction=-1.0 if inverse else 1.0,
         )
-        control, target = builder.add_op(quantum.CRz, control, target, full)
-        outputs = [control, target]
     else:
         raise EmitError(f"Unsupported HUGR gate: {gate_type}")
     _replace_quantum_results(
@@ -2435,14 +2804,12 @@ def _rotation_wire(
     if theta.is_constant():
         concrete = theta.get_const()
         assert concrete is not None
-        [halfturns] = builder.load(FloatVal(float(concrete) * scale / math.pi))
+        angle = float(concrete) * scale / math.pi
+        if not math.isfinite(angle):
+            raise EmitError("HUGR constant rotation angles must be finite")
+        [halfturns] = builder.load(FloatVal(angle))
     else:
-        resolved_theta = environment.get(theta.uuid)
-        parameter_name = theta.parameter_name()
-        if resolved_theta is None and parameter_name is not None:
-            resolved_theta = environment.get(f"__parameter__:{parameter_name}")
-        if resolved_theta is None:
-            raise EmitError(f"Unresolved HUGR rotation value {theta.name!r}")
+        resolved_theta = _resolve_classical_argument(theta, builder, environment)
         [factor] = builder.load(FloatVal(scale / math.pi))
         multiply = FLOAT_OPS_EXTENSION.get_op("fmul").instantiate()
         [halfturns] = builder.add_op(multiply, resolved_theta, factor)
@@ -2450,11 +2817,174 @@ def _rotation_wire(
     return result
 
 
+def _lower_global_phase(
+    phase: Value,
+    builder: Any,
+    environment: dict[str, Any],
+    scale: float = 1.0,
+) -> None:
+    """Emit a native zero-qubit TKET global-phase operation.
+
+    Args:
+        phase (Value): Radian-valued phase angle.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): UUID-to-wire mapping.
+        scale (float): Numeric factor applied before emission. Defaults to
+            one.
+    """
+    import tket_exts
+
+    rotation = _rotation_wire(builder, phase, environment, scale=scale)
+    operation = tket_exts.global_phase().get_op("global_phase").instantiate()
+    builder.add_op(operation, rotation)
+
+
+def _lower_phase_on_controls(
+    phase: Value,
+    builder: Any,
+    environment: dict[str, Any],
+    controls: list[Any],
+    direction: float = 1.0,
+) -> list[Any]:
+    """Emit an exact phase conditioned on any positive control width.
+
+    A one-wire projector phase is ``P(θ) = exp(iθ/2) Rz(θ)``. With two
+    wires, ``CP(θ) = exp(iθ/4) Rz(θ/2) CRz(θ)``. Keeping both decompositions
+    here prevents the zero-qubit factor from diverging between primitive and
+    transformed-call lowering. Wider projectors compute the conjunction of the
+    first ``n - 1`` controls onto ``n - 2`` clean ancillas, apply the two-wire
+    phase with the last original control, and uncompute the conjunction before
+    freeing every ancilla.
+
+    Args:
+        phase (Value): Radian-valued phase angle.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): UUID-to-wire mapping.
+        controls (list[Any]): Existing coherent control wires. At least one is
+            required.
+        direction (float): Positive for the phase and negative for its
+            inverse. Defaults to one.
+
+    Returns:
+        list[Any]: Updated linear control wires.
+
+    Raises:
+        EmitError: If no control wire is supplied.
+    """
+    from tket_exts import quantum
+
+    if len(controls) == 1:
+        _lower_global_phase(
+            phase,
+            builder,
+            environment,
+            scale=0.5 * direction,
+        )
+        rotation = _rotation_wire(
+            builder,
+            phase,
+            environment,
+            scale=direction,
+        )
+        [control] = builder.add_op(quantum.Rz, controls[0], rotation)
+        return [control]
+    if len(controls) == 2:
+        _lower_global_phase(
+            phase,
+            builder,
+            environment,
+            scale=0.25 * direction,
+        )
+        half = _rotation_wire(
+            builder,
+            phase,
+            environment,
+            scale=0.5 * direction,
+        )
+        [left] = builder.add_op(quantum.Rz, controls[0], half)
+        full = _rotation_wire(
+            builder,
+            phase,
+            environment,
+            scale=direction,
+        )
+        left, right = builder.add_op(quantum.CRz, left, controls[1], full)
+        return [left, right]
+    if not controls:
+        raise EmitError(
+            "HUGR controlled phase synthesis requires at least one control",
+            operation="GlobalPhaseOperation",
+        )
+
+    updated, ancillas = _compute_control_conjunction(builder, controls[:-1])
+    ancillas[-1], last = _lower_phase_on_controls(
+        phase, builder, environment, [ancillas[-1], controls[-1]], direction
+    )
+    return [*_uncompute_control_conjunction(builder, updated, ancillas), last]
+
+
+def _compute_control_conjunction(
+    builder: Any, controls: list[Any]
+) -> tuple[list[Any], list[Any]]:
+    """Compute the all-ones predicate onto a clean ancilla ladder.
+
+    Args:
+        builder (Any): HUGR dataflow builder.
+        controls (list[Any]): At least two coherent control wires.
+
+    Returns:
+        tuple[list[Any], list[Any]]: Updated controls and clean ancilla ladder,
+            whose final wire holds the conjunction.
+    """
+    from tket_exts import quantum
+
+    updated = list(controls)
+    ancillas = [builder.add_op(quantum.qAlloc)[0] for _ in controls[1:]]
+    updated[0], updated[1], ancillas[0] = builder.add_op(
+        quantum.toffoli, updated[0], updated[1], ancillas[0]
+    )
+    for index in range(2, len(updated)):
+        updated[index], ancillas[index - 2], ancillas[index - 1] = builder.add_op(
+            quantum.toffoli, updated[index], ancillas[index - 2], ancillas[index - 1]
+        )
+    return updated, ancillas
+
+
+def _uncompute_control_conjunction(
+    builder: Any, controls: list[Any], ancillas: list[Any]
+) -> list[Any]:
+    """Uncompute and free a conjunction ladder after its controlled operation.
+
+    Args:
+        builder (Any): HUGR dataflow builder.
+        controls (list[Any]): Updated coherent controls used by the ladder.
+        ancillas (list[Any]): Current ladder wires in computation order.
+
+    Returns:
+        list[Any]: Restored coherent controls.
+    """
+    from tket_exts import quantum
+
+    updated = list(controls)
+    for index in range(len(updated) - 1, 1, -1):
+        updated[index], ancillas[index - 2], ancillas[index - 1] = builder.add_op(
+            quantum.toffoli, updated[index], ancillas[index - 2], ancillas[index - 1]
+        )
+    updated[0], updated[1], ancillas[0] = builder.add_op(
+        quantum.toffoli, updated[0], updated[1], ancillas[0]
+    )
+    for ancilla in ancillas:
+        builder.add_op(quantum.qFree, ancilla)
+    return updated
+
+
 def _lower_pauli_evolution(
     operation: PauliEvolveOp,
     builder: Any,
     environment: dict[str, Any],
     live_qubits: dict[str, Any],
+    *,
+    inverse: bool = False,
 ) -> None:
     """Lower Pauli evolution at the HUGR target boundary.
 
@@ -2467,6 +2997,8 @@ def _lower_pauli_evolution(
         builder (Any): HUGR dataflow builder.
         environment (dict[str, Any]): UUID-to-wire mapping to update.
         live_qubits (dict[str, Any]): Live quantum mapping to update.
+        inverse (bool): Whether to emit the adjoint evolution. Defaults to
+            ``False``.
 
     Raises:
         EmitError: If the Hamiltonian is unbound, the qubit operand is not a
@@ -2478,9 +3010,11 @@ def _lower_pauli_evolution(
 
     qubit_operand = operation.qubits
     result = operation.evolved_qubits
-    if not isinstance(qubit_operand, ArrayValue) or not isinstance(result, ArrayValue):
+    source = result if inverse else qubit_operand
+    destination = qubit_operand if inverse else result
+    if not isinstance(source, ArrayValue) or not isinstance(destination, ArrayValue):
         raise EmitError("HUGR Pauli evolution requires a fixed qubit vector")
-    if qubit_operand.uuid not in environment:
+    if source.uuid not in environment:
         raise EmitError("HUGR Pauli evolution cannot resolve its qubit vector")
     hamiltonian = (
         cast(Any, operation.observable.get_const())
@@ -2491,8 +3025,18 @@ def _lower_pauli_evolution(
         raise EmitError("HUGR Pauli evolution requires a bound Hamiltonian")
     if not isinstance(hamiltonian, qm_o.Hamiltonian):
         raise EmitError("HUGR Pauli evolution binding is not a Hamiltonian")
+    _validate_pauli_evolution_hamiltonian(hamiltonian)
 
-    qubits = list(environment[qubit_operand.uuid])
+    qubits = list(environment[source.uuid])
+    direction = -1.0 if inverse else 1.0
+    constant_value = float(hamiltonian.constant.real)
+    if constant_value:
+        _lower_global_phase(
+            operation.gamma,
+            builder,
+            environment,
+            scale=-direction * constant_value,
+        )
     for operators, coefficient in hamiltonian:
         if not operators or is_close_zero(abs(coefficient)):
             continue
@@ -2519,7 +3063,7 @@ def _lower_pauli_evolution(
             builder,
             operation.gamma,
             environment,
-            scale=2.0 * float(coefficient.real),
+            scale=direction * 2.0 * float(coefficient.real),
         )
         [selected[-1]] = builder.add_op(quantum.Rz, selected[-1], rotation)
         for index in range(len(selected) - 2, -1, -1):
@@ -2538,11 +3082,11 @@ def _lower_pauli_evolution(
                 [wire] = builder.add_op(quantum.S, wire)
             qubits[item.index] = wire
 
-    environment[result.uuid] = qubits
-    environment[qubit_operand.uuid] = qubits
+    environment[source.uuid] = qubits
+    environment[destination.uuid] = qubits
     for index in range(len(qubits)):
-        live_qubits.pop(f"{qubit_operand.uuid}:{index}", None)
-        live_qubits[f"{result.uuid}:{index}"] = qubits[index]
+        live_qubits.pop(f"{source.uuid}:{index}", None)
+        live_qubits[f"{destination.uuid}:{index}"] = qubits[index]
 
 
 def _lower_measure(
@@ -2551,7 +3095,7 @@ def _lower_measure(
     environment: dict[str, Any],
     live_qubits: dict[str, Any],
 ) -> None:
-    """Lower destructive Qamomile measurement and free the HUGR qubit.
+    """Lower destructive Qamomile measurement and retire every physical alias.
 
     Args:
         operation (MeasureOperation | MeasureVectorOperation): Measurement
@@ -2561,28 +3105,220 @@ def _lower_measure(
         live_qubits (dict[str, Any]): Live quantum mapping to update.
 
     Raises:
-        EmitError: If vector measurement reaches scalar lowering.
+        EmitError: If an array measurement has no array result or an operand
+            wire cannot be resolved.
     """
     from tket_exts import quantum
 
     operand = operation.operands[0]
-    if isinstance(operand, ArrayValue):
-        if not isinstance(operation.results[0], ArrayValue):
-            raise EmitError("HUGR vector measurement requires an array result")
-        bits = []
-        for index, wire in enumerate(environment[operand.uuid]):
-            qubit, bit = builder.add_op(quantum.measure, wire)
-            builder.add_op(quantum.qFree, qubit)
-            live_qubits.pop(f"{operand.uuid}:{index}", None)
-            bits.append(bit)
-        environment[operation.results[0].uuid] = bits
-    else:
-        qubit, bit = builder.add_op(
-            quantum.measure, _resolve_wire(operand, environment)
-        )
+    is_array = isinstance(operand, ArrayValue)
+    if is_array and not isinstance(operation.results[0], ArrayValue):
+        raise EmitError("HUGR vector measurement requires an array result")
+    resolved = _resolve_wire(operand, environment)
+    wires = resolved if is_array else [resolved]
+    bits = []
+    for wire in wires:
+        qubit, bit = builder.add_op(quantum.measure, wire)
         builder.add_op(quantum.qFree, qubit)
-        live_qubits.pop(_quantum_key(operand, environment), None)
-        environment[operation.results[0].uuid] = bit
+        bits.append(bit)
+    # Views and SSA versions can share a physical wire under different keys.
+    # Retire all measured aliases in one pass so block cleanup cannot free a
+    # consumed root wire again, while untouched root qubits remain live.
+    consumed = set(wires)
+    for key, wire in list(live_qubits.items()):
+        if wire in consumed:
+            live_qubits.pop(key)
+    environment[operation.results[0].uuid] = bits if is_array else bits[0]
+
+
+def _lower_measure_qfixed(
+    operation: MeasureQFixedOperation,
+    builder: Any,
+    environment: dict[str, Any],
+    live_qubits: dict[str, Any],
+) -> None:
+    """Measure and decode a fixed-point quantum register in the HUGR graph.
+
+    Qamomile stores fixed-point registers least-significant bit first. The
+    target therefore converts each destructive measurement result to Float,
+    applies its positional weight, and sums the terms inside the program
+    graph instead of introducing a host-side classical segment.
+
+    Args:
+        operation (MeasureQFixedOperation): Fixed-point measurement to lower.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): UUID-to-wire mapping to update.
+        live_qubits (dict[str, Any]): Live quantum mapping to update.
+
+    Raises:
+        EmitError: If the fixed-point carrier is not a nonempty qubit array or
+            its declared bit width disagrees with the carrier width.
+    """
+    from tket_exts import quantum
+
+    from hugr import tys
+    from hugr.std.float import FLOAT_OPS_EXTENSION, FLOAT_T, FloatVal
+    from hugr.std.int import CONVERSIONS_EXTENSION, int_t
+
+    carrier = _resolve_wire(operation.operands[0], environment)
+    if not isinstance(carrier, list) or not carrier:
+        raise EmitError("HUGR fixed-point measurement requires a qubit array")
+    num_bits = operation.num_bits or len(carrier)
+    if num_bits != len(carrier):
+        raise EmitError(
+            "HUGR fixed-point measurement width disagrees with its qubit carrier"
+        )
+
+    bit_int_type = int_t(0)
+    from_bool = CONVERSIONS_EXTENSION.get_op("ifrombool").instantiate()
+    to_float = CONVERSIONS_EXTENSION.get_op("convert_u").instantiate(
+        list(bit_int_type.args),
+        concrete_signature=tys.FunctionType([bit_int_type], [FLOAT_T]),
+    )
+    binary_float_signature = tys.FunctionType(
+        [FLOAT_T, FLOAT_T],
+        [FLOAT_T],
+    )
+    multiply = FLOAT_OPS_EXTENSION.get_op("fmul").instantiate(
+        concrete_signature=binary_float_signature
+    )
+    add = FLOAT_OPS_EXTENSION.get_op("fadd").instantiate(
+        concrete_signature=binary_float_signature
+    )
+    [total] = builder.load(FloatVal(0.0))
+    for index, wire in enumerate(carrier):
+        qubit, bit = builder.add_op(quantum.measure, wire)
+        builder.add_op(quantum.qFree, qubit)
+        for key, live_wire in list(live_qubits.items()):
+            if live_wire == wire:
+                live_qubits.pop(key)
+        [integer] = builder.add_op(from_bool, bit)
+        [term] = builder.add_op(to_float, integer)
+        exponent = operation.int_bits - num_bits + index
+        if exponent != 0:
+            [factor] = builder.load(FloatVal(2.0**exponent))
+            [term] = builder.add_op(multiply, term, factor)
+        [total] = builder.add_op(add, total, term)
+    environment[operation.results[0].uuid] = total
+
+
+def _decode_qint_bits(bits: list[Any], builder: Any) -> Any:
+    """Decode least-significant-first bits using exact 64-bit integer operations.
+
+    Args:
+        bits (list[Any]): Boolean wires in register order, at most 64 bits.
+        builder (Any): HUGR dataflow builder.
+
+    Returns:
+        Any: Unsigned 64-bit integer wire, including zero for an empty input.
+
+    Raises:
+        EmitError: If the bit count exceeds the HUGR UInt carrier width.
+    """
+    from hugr import tys
+    from hugr.std.int import CONVERSIONS_EXTENSION, INT_OPS_EXTENSION, int_t
+
+    _qint_width(QUIntType(width=len(bits)))
+    integer_type = _hugr_uint_type()
+    bit_type = int_t(0)
+    from_bool = CONVERSIONS_EXTENSION.get_op("ifrombool").instantiate()
+    widen = INT_OPS_EXTENSION.get_op("iwiden_u").instantiate(
+        [*bit_type.args, *integer_type.args],
+        concrete_signature=tys.FunctionType([bit_type], [integer_type]),
+    )
+    signature = tys.FunctionType([integer_type, integer_type], [integer_type])
+    multiply = INT_OPS_EXTENSION.get_op("imul").instantiate(
+        list(integer_type.args), concrete_signature=signature
+    )
+    add = INT_OPS_EXTENSION.get_op("iadd").instantiate(
+        list(integer_type.args), concrete_signature=signature
+    )
+    [total] = builder.load(_hugr_uint_value(0))
+    for index, bit in enumerate(bits):
+        [integer] = builder.add_op(from_bool, bit)
+        [term] = builder.add_op(widen, integer)
+        if index:
+            [weight] = builder.load(_hugr_uint_value(1 << index))
+            [term] = builder.add_op(multiply, term, weight)
+        [total] = builder.add_op(add, total, term)
+    return total
+
+
+def _lower_measure_qint(
+    operation: MeasureQIntOperation,
+    builder: Any,
+    environment: dict[str, Any],
+    live_qubits: dict[str, Any],
+) -> None:
+    """Destructively measure a QInt and decode it inside the HUGR graph.
+
+    Args:
+        operation (MeasureQIntOperation): Quantum integer measurement to lower.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): UUID-to-wire mapping to update.
+        live_qubits (dict[str, Any]): Live physical quantum aliases to retire.
+
+    Raises:
+        EmitError: If the operand or result type is invalid, the width is
+            unresolved or outside zero to 64, or the carrier width disagrees.
+    """
+    from tket_exts import quantum
+
+    if (
+        len(operation.operands) != 1
+        or not isinstance(operation.operands[0].type, QUIntType)
+        or len(operation.results) != 1
+        or not isinstance(operation.results[0].type, UIntType)
+    ):
+        raise EmitError(
+            "HUGR QInt measurement requires one QInt operand and UInt result"
+        )
+    width = _qint_width(operation.operands[0].type)
+    carrier = _resolve_wire(operation.operands[0], environment)
+    if not isinstance(carrier, list) or len(carrier) != width:
+        raise EmitError("HUGR QInt measurement width disagrees with its qubit carrier")
+    bits = []
+    for wire in carrier:
+        qubit, bit = builder.add_op(quantum.measure, wire)
+        builder.add_op(quantum.qFree, qubit)
+        bits.append(bit)
+    consumed = set(carrier)
+    for key, wire in list(live_qubits.items()):
+        if wire in consumed:
+            live_qubits.pop(key)
+    environment[operation.results[0].uuid] = _decode_qint_bits(bits, builder)
+
+
+def _lower_cast(
+    operation: CastOperation,
+    environment: dict[str, Any],
+    live_qubits: dict[str, Any],
+) -> None:
+    """Alias a fixed-width quantum register to its original carrier.
+
+    Args:
+        operation (CastOperation): Quantum reinterpretation operation.
+        environment (dict[str, Any]): Available scalar and array wires.
+        live_qubits (dict[str, Any]): Live physical quantum aliases to update.
+
+    Raises:
+        EmitError: If cast arity or declared width disagrees with its carrier.
+    """
+    if len(operation.operands) != 1 or len(operation.results) != 1:
+        raise EmitError("HUGR cast requires one source and one result")
+    carrier = _resolve_wire(operation.operands[0], environment)
+    width = len(carrier) if isinstance(carrier, list) else 1
+    if operation.qubit_mapping and len(operation.qubit_mapping) != width:
+        raise EmitError("HUGR cast width disagrees with its quantum carrier")
+    result = operation.results[0]
+    if isinstance(result.type, QUIntType):
+        if not isinstance(carrier, list) or _qint_width(result.type) != width:
+            raise EmitError("HUGR QInt cast width disagrees with its qubit carrier")
+        _publish_transformed_result(
+            operation.operands[0], result, carrier, environment, live_qubits
+        )
+        return
+    environment[operation.results[0].uuid] = carrier
 
 
 def _lower_project(
@@ -2664,7 +3400,8 @@ def _lower_call(
         functions (dict[CallableRef, Any]): Predeclared HUGR functions.
 
     Raises:
-        EmitError: If the call is transformed, opaque, or unresolved.
+        EmitError: If the call is transformed, opaque, unresolved, or has an
+            unsupported carrier width.
     """
     if operation.transform is not CallTransform.DIRECT:
         _lower_transformed_call(
@@ -2680,7 +3417,8 @@ def _lower_call(
     operands = [
         (
             _pack_value(value, environment, builder)
-            if isinstance(value, ArrayValue)
+            if isinstance(value, (ArrayValue, TupleValue, DictValue))
+            or isinstance(value.type, QUIntType)
             else _resolve_wire(value, environment)
             if value.type.is_quantum()
             else _resolve_classical_argument(value, builder, environment)
@@ -2701,12 +3439,12 @@ def _lower_call(
             live_qubits.pop(key)
     quantum_sources = [value for value in operation.operands if value.type.is_quantum()]
     for result, wire in zip(operation.results, outputs, strict=True):
-        if isinstance(result, ArrayValue):
+        if isinstance(result, (TupleValue, DictValue)):
+            _unpack_input(result, wire, builder, environment)
+        elif isinstance(result, ArrayValue) or isinstance(result.type, QUIntType):
             from hugr import ops
 
-            element_types = [
-                _lower_type(result.type) for _ in range(_array_size(result))
-            ]
+            element_types = _carrier_element_types(result)
             elements = list(builder.add_op(ops.UnpackTuple(element_types), wire))
             if result.type.is_quantum():
                 source = next(
@@ -2746,13 +3484,148 @@ def _lower_call(
             environment[result.uuid] = wire
 
 
+def _lower_select(
+    operation: SelectOperation,
+    builder: Any,
+    environment: dict[str, Any],
+    live_qubits: dict[str, Any],
+    control_wires: list[Any] | None = None,
+    inverse: bool = False,
+) -> list[Any]:
+    """Lower SELECT cases through the common coherent-call legalization path.
+
+    Preserve the semantic operation until this target boundary. Each case
+    applies only on its LSB-first index pattern, so unused index values retain
+    identity and case-global phases remain observable on coherent indices.
+
+    Args:
+        operation (SelectOperation): Multiplexer with prepared case bodies.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): UUID-to-wire mapping.
+        live_qubits (dict[str, Any]): Live quantum resource mapping.
+        control_wires (list[Any] | None): Inherited coherent controls, active
+            when all are one. Defaults to no inherited controls.
+        inverse (bool): Whether to apply every case's adjoint. Defaults to false.
+
+    Returns:
+        list[Any]: Updated inherited control wires.
+
+    Raises:
+        EmitError: If the index width, quantum operand layout, or a case body
+            cannot be lowered by the target.
+    """
+    operands = [*operation.index_operands, *operation.target_operands]
+    if len(operands) != len(operation.results) or not operation.target_operands:
+        raise EmitError(
+            "SELECT quantum operand/result arity mismatch", operation="SelectOperation"
+        )
+    sources = list(operation.results) if inverse else operands
+    destinations = operands if inverse else list(operation.results)
+    index_sources = sources[: operation.num_index_args]
+    targets = sources[operation.num_index_args :]
+    inherited = list(control_wires or ())
+    indices: list[Any] = []
+    for source in index_sources:
+        resolved = _resolve_wire(source, environment)
+        indices.extend(resolved if isinstance(resolved, list) else [resolved])
+    width = operation.num_index_qubits
+    if isinstance(width, Value):
+        width = (
+            width.get_const()
+            if width.is_constant()
+            else environment.get(f"__index__:{width.uuid}")
+        )
+    if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+        raise EmitError(
+            "SELECT index width must resolve to a positive integer",
+            operation="SelectOperation",
+        )
+    if width != len(indices) or (operation.num_cases - 1).bit_length() > width:
+        raise EmitError(
+            f"SELECT index arguments expanded to {len(indices)} qubit(s), but num_index_qubits resolves to {width}",
+            operation="SelectOperation",
+        )
+
+    local = {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in environment.items()
+    }
+    controls = [Value(type=QubitType(), name="") for _ in [*inherited, *indices]]
+    for value, wire in zip(controls, [*inherited, *indices], strict=True):
+        local[value.uuid] = wire
+    for source in targets:
+        resolved = _resolve_wire(source, environment)
+        local[source.uuid] = list(resolved) if isinstance(resolved, list) else resolved
+
+    for case_index, body in enumerate(operation.case_blocks):
+        quantum_inputs = [
+            value for value in body.input_values if value.type.is_quantum()
+        ]
+        broadcast = (
+            len(targets) == len(quantum_inputs) == 1
+            and isinstance(targets[0], ArrayValue)
+            and not isinstance(quantum_inputs[0], ArrayValue)
+        )
+        target_sets = [targets]
+        if broadcast:
+            target_sets = []
+            for wire in local[targets[0].uuid]:
+                scalar = Value(type=QubitType(), name="")
+                local[scalar.uuid] = wire
+                target_sets.append([scalar])
+        for case_targets in target_sets:
+            case_operands = [*controls, *case_targets, *operation.param_operands]
+            case_results = [*controls, *case_targets]
+            activation = (case_index << len(inherited)) | ((1 << len(inherited)) - 1)
+            call = ConcreteControlledU(
+                block=body,
+                num_controls=len(controls),
+                operands=case_operands,
+                results=case_results,
+                control_value=activation,
+            )
+            _lower_transformed_call(call, builder, local, {}, {}, adjoint=inverse)
+        if broadcast:
+            local[targets[0].uuid] = [local[group[0].uuid] for group in target_sets]
+
+    updated_controls = [local[value.uuid] for value in controls]
+    offset = len(inherited)
+    for source, destination in zip(
+        index_sources, destinations[: operation.num_index_args], strict=True
+    ):
+        width = (
+            len(_resolve_wire(source, environment))
+            if isinstance(source, ArrayValue)
+            else 1
+        )
+        selected = updated_controls[offset : offset + width]
+        offset += width
+        _publish_transformed_result(
+            source,
+            destination,
+            selected if isinstance(source, ArrayValue) else selected[0],
+            environment,
+            live_qubits,
+        )
+    for source, destination in zip(
+        targets, destinations[operation.num_index_args :], strict=True
+    ):
+        _publish_transformed_result(
+            source, destination, local[source.uuid], environment, live_qubits
+        )
+    return updated_controls[: len(inherited)]
+
+
 def _lower_transformed_call(
     operation: InvokeOperation | ControlledUOperation | InverseBlockOperation,
     builder: Any,
     environment: dict[str, Any],
     live_qubits: dict[str, Any],
     functions: dict[CallableRef, Any],
-) -> None:
+    *,
+    outer_controls: list[Any] | None = None,
+    adjoint: bool = False,
+) -> list[Any]:
     """Inline a transformed callable at the target legalization boundary.
 
     Args:
@@ -2762,6 +3635,13 @@ def _lower_transformed_call(
         environment (dict[str, Any]): UUID-to-wire mapping.
         live_qubits (dict[str, Any]): Live quantum mapping.
         functions (dict[CallableRef, Any]): Predeclared HUGR functions.
+        outer_controls (list[Any] | None): Inherited coherent controls from an
+            enclosing transformed operation. Defaults to no outer controls.
+        adjoint (bool): Whether to invert this invocation as part of an outer
+            adjoint operation sequence. Defaults to false.
+
+    Returns:
+        list[Any]: Updated inherited coherent control wires.
 
     Raises:
         EmitError: If the callable body or transform profile is unsupported.
@@ -2795,16 +3675,42 @@ def _lower_transformed_call(
             for value in operation.operands
             if value.type.is_classical() or value.type.is_object()
         ]
-        inverse = operation.transform is CallTransform.INVERSE
+        inverse = operation.transform.is_inverse
         display_name = operation.target.name
+    result_quantum = [value for value in operation.results if value.type.is_quantum()]
+    if adjoint:
+        result_quantum, sources = [*controls, *targets], result_quantum
+        controls, targets = sources[: len(controls)], sources[len(controls) :]
+        inverse = not inverse
     if body is None:
         raise EmitError(f"Transformed HUGR callable {display_name!r} is opaque")
-    local = dict(environment)
+    body = inline_callables(body)
+    static_bindings = {}
+    for formal, actual in pair_block_operands(body, [*targets, *classical]):
+        if isinstance(actual, Value) and not actual.type.is_quantum():
+            concrete = (
+                actual.get_const()
+                if actual.is_constant()
+                else environment.get(f"__index__:{actual.uuid}")
+            )
+            if concrete is not None:
+                static_bindings[formal.uuid] = concrete
+    if any(isinstance(nested, IfOperation) for nested in body.operations):
+        body = lower_compile_time_ifs_preserving_loop_conditions(body, static_bindings)
+    power = _resolve_transformed_power(operation, environment)
+    # Array carriers are mutable lists. Keep body-local element updates from
+    # changing parent aliases before result publication consumes the old wires.
+    local = {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in environment.items()
+    }
     body_quantum_inputs = [
         value for value in body.input_values if value.type.is_quantum()
     ]
     body_classical_inputs = [
-        value for value in body.input_values if value.type.is_classical()
+        value
+        for value in body.input_values
+        if value.type.is_classical() or value.type.is_object()
     ]
     body_quantum_outputs = [
         value for value in body.output_values if value.type.is_quantum()
@@ -2814,7 +3720,10 @@ def _lower_transformed_call(
         if len(quantum_entry) != len(targets):
             raise EmitError("HUGR transformed call quantum arity mismatch")
         for formal, actual in zip(quantum_entry, targets, strict=True):
-            local[formal.uuid] = _resolve_wire(actual, environment)
+            resolved = _resolve_wire(actual, environment)
+            local[formal.uuid] = (
+                list(resolved) if isinstance(resolved, list) else resolved
+            )
         if len(body_classical_inputs) != len(classical):
             raise EmitError("HUGR transformed call classical arity mismatch")
         pairs = zip(body_classical_inputs, classical, strict=True)
@@ -2829,14 +3738,29 @@ def _lower_transformed_call(
         )
         for formal, actual in operand_pairs:
             if formal.type.is_quantum():
-                local[formal.uuid] = _resolve_wire(cast(Value, actual), environment)
+                resolved = _resolve_wire(cast(Value, actual), environment)
+                local[formal.uuid] = (
+                    list(resolved) if isinstance(resolved, list) else resolved
+                )
     for formal, actual in pairs:
+        actual_value = cast(Value, actual)
         resolved = _resolve_classical_argument(
-            cast(Value, actual),
+            actual_value,
             builder,
             environment,
         )
         local[formal.uuid] = resolved
+        known_index: Any = (
+            actual_value.get_const()
+            if actual_value.is_constant()
+            else environment.get(f"__index__:{actual_value.uuid}")
+        )
+        if (
+            isinstance(formal.type, UIntType)
+            and not isinstance(known_index, bool)
+            and isinstance(known_index, int)
+        ):
+            local[f"__index__:{formal.uuid}"] = known_index
         parameter_name = formal.parameter_name()
         if parameter_name is not None:
             local[f"__parameter__:{parameter_name}"] = resolved
@@ -2845,53 +3769,36 @@ def _lower_transformed_call(
     for value in controls:
         resolved = _resolve_wire(value, environment)
         control_wires.extend(resolved if isinstance(resolved, list) else [resolved])
-    sequence = reversed(body.operations) if inverse else body.operations
-    for nested in sequence:
-        if isinstance(nested, ReturnOperation):
-            continue
-        if isinstance(nested, CInitOperation):
-            _lower_cinit(nested, builder, local)
-            continue
-        if isinstance(nested, PauliEvolveOp):
-            if len(control_wires) != 1:
-                raise EmitError(
-                    "HUGR transformed Pauli evolution supports exactly one control"
-                )
-            control_wires[0] = _lower_controlled_pauli_evolution(
-                nested,
-                builder,
-                local,
-                control_wires[0],
-                inverse,
-            )
-            continue
-        if not isinstance(nested, GateOperation):
-            raise EmitError(
-                "HUGR transformed calls currently require primitive unitary bodies"
-            )
-        if controls:
-            control_wires = _lower_controlled_gate(
-                nested,
-                builder,
-                local,
-                control_wires,
-                inverse,
-            )
-        else:
-            lowered_gate = nested
-            if inverse:
-                lowered_gate = dataclasses.replace(
-                    nested,
-                    operands=[
-                        *nested.results,
-                        *([nested.theta] if nested.theta is not None else []),
-                    ],
-                    results=list(nested.qubit_operands),
-                )
-            _lower_gate(lowered_gate, builder, local, {}, inverse=inverse)
+    control_value = _transformed_control_value(operation)
+    if power > 0 and control_value is not None:
+        control_wires = _toggle_zero_controls(
+            builder,
+            control_wires,
+            control_value,
+        )
+    inherited = list(outer_controls or ())
+    control_wires = [*inherited, *control_wires]
+    for _ in range(power):
+        control_wires = _lower_transformed_operations(
+            body.operations,
+            builder,
+            local,
+            control_wires,
+            inverse,
+        )
+    inherited, control_wires = (
+        control_wires[: len(inherited)],
+        control_wires[len(inherited) :],
+    )
+    if power > 0 and control_value is not None:
+        control_wires = _toggle_zero_controls(
+            builder,
+            control_wires,
+            control_value,
+            reverse=True,
+        )
 
     quantum_exit = body_quantum_inputs if inverse else body_quantum_outputs
-    result_quantum = [value for value in operation.results if value.type.is_quantum()]
     result_controls = result_quantum[: len(controls)]
     result_targets = result_quantum[len(controls) :]
     for actual in [*controls, *targets]:
@@ -2903,11 +3810,489 @@ def _lower_transformed_call(
         control_offset += width
         wire: Any = selected if isinstance(result, ArrayValue) else selected[0]
         _publish_transformed_result(source, result, wire, environment, live_qubits)
+    if power == 0:
+        for source, result in zip(targets, result_targets, strict=True):
+            wire = _resolve_wire(source, environment)
+            _publish_transformed_result(
+                source,
+                result,
+                wire,
+                environment,
+                live_qubits,
+            )
+        return inherited
     for source, result, formal in zip(
         targets, result_targets, quantum_exit, strict=True
     ):
-        wire = local[formal.uuid]
+        wire = local.get(formal.uuid)
+        if wire is None:
+            entry = next(
+                (
+                    value
+                    for value in quantum_entry
+                    if value.logical_id == formal.logical_id
+                ),
+                None,
+            )
+            if entry is None or entry.uuid not in local:
+                raise EmitError(
+                    "HUGR transformed call cannot resolve a zero-trip quantum exit"
+                )
+            wire = local[entry.uuid]
+            local[formal.uuid] = wire
         _publish_transformed_result(source, result, wire, environment, live_qubits)
+    return inherited
+
+
+def _transformed_control_value(
+    operation: InvokeOperation | ControlledUOperation | InverseBlockOperation,
+) -> int | None:
+    """Return the activation value carried by a transformed call.
+
+    Args:
+        operation (InvokeOperation | ControlledUOperation |
+            InverseBlockOperation): Transformed operation being lowered.
+
+    Returns:
+        int | None: LSB-first activation value, or ``None`` for all-ones.
+    """
+    if isinstance(operation, (ConcreteControlledU, InverseBlockOperation)):
+        return operation.control_value
+    if isinstance(operation, InvokeOperation) and operation.transform.is_controlled:
+        return operation.control_value
+    return None
+
+
+def _toggle_zero_controls(
+    builder: Any,
+    control_wires: list[Any],
+    control_value: int,
+    *,
+    reverse: bool = False,
+) -> list[Any]:
+    """Apply X to control wires whose required activation bit is zero.
+
+    HUGR quantum wires are linear, so each X result replaces the consumed
+    wire. The returned list must be used both for the transformed body and for
+    the closing bracket.
+
+    Args:
+        builder (Any): HUGR dataflow builder.
+        control_wires (list[Any]): Current control wires in LSB-first order.
+        control_value (int): Required computational-basis value.
+        reverse (bool): Whether to visit bracket positions in reverse order.
+            Defaults to ``False``.
+
+    Returns:
+        list[Any]: Updated linear control wires after the X gates.
+
+    Raises:
+        EmitError: If no physical controls are available for the value.
+        TypeError: If ``control_value`` is not a Python ``int``.
+        ValueError: If the activation value does not fit the control width.
+    """
+    if not control_wires:
+        raise EmitError(
+            "HUGR transformed control_value requires physical control wires."
+        )
+    from tket_exts import quantum
+
+    pattern = control_pattern_for_value(control_value, len(control_wires))
+    positions = [index for index, required in enumerate(pattern) if required == 0]
+    if reverse:
+        positions.reverse()
+    updated = list(control_wires)
+    for position in positions:
+        [updated[position]] = builder.add_op(quantum.X, updated[position])
+    return updated
+
+
+def _lower_transformed_operations(
+    operations: list[Operation],
+    builder: Any,
+    environment: dict[str, Any],
+    control_wires: list[Any],
+    inverse: bool,
+) -> list[Any]:
+    """Lower one transformable operation sequence, including static loops.
+
+    Classical scalar setup is evaluated in source order even for an inverse
+    call. Quantum operations are then emitted in reverse order with their
+    adjoints, which preserves parameter dependencies without pretending that
+    classical value construction itself is unitary.
+
+    Args:
+        operations (list[Operation]): Source-order body operations.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): Body-local UUID-to-wire mapping.
+        control_wires (list[Any]): Current linear control wires, or an empty
+            list for an uncontrolled inverse.
+        inverse (bool): Whether to emit the adjoint operation sequence.
+
+    Returns:
+        list[Any]: Updated linear control wires.
+
+    Raises:
+        EmitError: If an operation is not reversible in the supported HUGR
+            transformed-call profile.
+    """
+    merged_outputs: list[ValueLike] = [
+        result
+        for operation in operations
+        if isinstance(operation, IfOperation)
+        for result in operation.results
+        if result.type.is_quantum()
+    ]
+    specialized_outputs = merged_outputs
+    if merged_outputs:
+        bindings = {
+            key.removeprefix("__index__:"): value
+            for key, value in environment.items()
+            if key.startswith("__index__:")
+        }
+        specialized = lower_compile_time_ifs_preserving_loop_conditions(
+            Block(operations=operations, output_values=merged_outputs), bindings
+        )
+        operations = specialized.operations
+        specialized_outputs = specialized.output_values
+        if inverse:
+            for original, selected in zip(
+                merged_outputs, specialized_outputs, strict=True
+            ):
+                if original.uuid in environment:
+                    environment[selected.uuid] = environment[original.uuid]
+    if inverse:
+        for operation in operations:
+            if isinstance(operation, CInitOperation):
+                _lower_cinit(operation, builder, environment)
+            elif isinstance(operation, BinOp):
+                _lower_binop(operation, builder, environment)
+
+    sequence = reversed(operations) if inverse else operations
+    for operation in sequence:
+        if isinstance(operation, ReturnOperation):
+            continue
+        if isinstance(operation, CInitOperation):
+            if not inverse:
+                _lower_cinit(operation, builder, environment)
+            continue
+        if isinstance(operation, BinOp):
+            if not inverse:
+                _lower_binop(operation, builder, environment)
+            continue
+        if isinstance(operation, ForOperation):
+            control_wires = _lower_transformed_static_for(
+                operation,
+                builder,
+                environment,
+                control_wires,
+                inverse,
+            )
+            continue
+        if isinstance(
+            operation, (InvokeOperation, ControlledUOperation, InverseBlockOperation)
+        ):
+            control_wires = _lower_transformed_call(
+                operation,
+                builder,
+                environment,
+                {},
+                {},
+                outer_controls=control_wires,
+                adjoint=inverse,
+            )
+            continue
+        if isinstance(operation, SelectOperation):
+            control_wires = _lower_select(
+                operation, builder, environment, {}, control_wires, inverse
+            )
+            continue
+        if isinstance(operation, GlobalPhaseOperation):
+            direction = -1.0 if inverse else 1.0
+            if control_wires:
+                control_wires = _lower_phase_on_controls(
+                    operation.phase,
+                    builder,
+                    environment,
+                    control_wires,
+                    direction,
+                )
+            else:
+                _lower_global_phase(
+                    operation.phase,
+                    builder,
+                    environment,
+                    scale=direction,
+                )
+            continue
+        if isinstance(operation, PauliEvolveOp):
+            if not control_wires:
+                _lower_pauli_evolution(
+                    operation,
+                    builder,
+                    environment,
+                    {},
+                    inverse=inverse,
+                )
+                continue
+            if len(control_wires) != 1:
+                raise EmitError(
+                    "HUGR transformed Pauli evolution supports exactly one control"
+                )
+            control_wires[0] = _lower_controlled_pauli_evolution(
+                operation,
+                builder,
+                environment,
+                control_wires[0],
+                inverse,
+            )
+            continue
+        if not isinstance(operation, GateOperation):
+            raise EmitError(
+                "HUGR transformed calls currently support primitive unitary "
+                "operations and statically bounded for-loops; found "
+                f"{type(operation).__name__}",
+                operation=type(operation).__name__,
+            )
+        if control_wires:
+            control_wires = _lower_controlled_gate(
+                operation,
+                builder,
+                environment,
+                control_wires,
+                inverse,
+            )
+        else:
+            lowered_gate = operation
+            if inverse:
+                lowered_gate = dataclasses.replace(
+                    operation,
+                    operands=[
+                        *operation.results,
+                        *([operation.theta] if operation.theta is not None else []),
+                    ],
+                    results=list(operation.qubit_operands),
+                )
+            _lower_gate(lowered_gate, builder, environment, {}, inverse=inverse)
+    if not inverse:
+        for original, selected in zip(merged_outputs, specialized_outputs, strict=True):
+            environment[original.uuid] = _resolve_wire(
+                cast(Value, selected), environment
+            )
+    return control_wires
+
+
+def _lower_transformed_static_for(
+    operation: ForOperation,
+    builder: Any,
+    environment: dict[str, Any],
+    control_wires: list[Any],
+    inverse: bool,
+) -> list[Any]:
+    """Unroll a static for-loop inside a controlled or inverse callable.
+
+    Inverse lowering traverses both the iteration range and each iteration's
+    quantum operation sequence backwards. Runtime bounds stay outside this
+    profile because HUGR does not yet thread quantum controls through a native
+    loop region, while loop-carried values would also require reversible region
+    state or iteration history for inversion.
+
+    Args:
+        operation (ForOperation): Loop operation to unroll.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): Body-local UUID-to-wire mapping.
+        control_wires (list[Any]): Current linear control wires, or an empty
+            list for an uncontrolled inverse.
+        inverse (bool): Whether to emit the adjoint loop.
+
+    Returns:
+        list[Any]: Updated linear control wires.
+
+    Raises:
+        EmitError: If loop metadata is malformed, a bound is dynamic, the
+            step is zero, or the loop carries values between iterations.
+    """
+    try:
+        validate_region_args(operation)
+    except ValueError as error:
+        raise EmitError(str(error), operation="ForOperation") from error
+    if operation.region_args or operation.loop_carried_rebinds:
+        names = [region.var_name for region in operation.region_args]
+        names.extend(rebind.var_name for rebind in operation.loop_carried_rebinds)
+        detail = f" ({', '.join(names)})" if names else ""
+        raise EmitError(
+            f"HUGR transformed for-loops do not support loop-carried values{detail}.",
+            operation="ForOperation",
+        )
+    if len(operation.operands) < 3:
+        raise EmitError(
+            "HUGR transformed for-loop requires start, stop, and step operands",
+            operation="ForOperation",
+        )
+    bounds: list[int] = []
+    for value in operation.operands[:3]:
+        resolved: Any = (
+            value.get_const()
+            if value.is_constant()
+            else environment.get(f"__index__:{value.uuid}")
+        )
+        if isinstance(resolved, bool) or not isinstance(resolved, int):
+            raise EmitError(
+                "HUGR transformed for-loop bounds must be compile-time constants",
+                operation="ForOperation",
+            )
+        bounds.append(resolved)
+    start, stop, step = bounds
+    if step == 0:
+        raise EmitError(
+            "HUGR transformed for-loop step cannot be zero",
+            operation="ForOperation",
+        )
+    indices = range(start, stop, step)
+    if not indices:
+        _alias_zero_trip_transformed_quantum_values(
+            operation.operations,
+            environment,
+            inverse,
+        )
+        return control_wires
+    sequence = reversed(indices) if inverse else indices
+    for index in sequence:
+        if operation.loop_var_value is not None:
+            [loop_wire] = builder.load(_hugr_uint_value(index))
+            environment[operation.loop_var_value.uuid] = loop_wire
+            environment[f"__index__:{operation.loop_var_value.uuid}"] = index
+        control_wires = _lower_transformed_operations(
+            operation.operations,
+            builder,
+            environment,
+            control_wires,
+            inverse,
+        )
+    return control_wires
+
+
+def _alias_zero_trip_transformed_quantum_values(
+    operations: list[Operation],
+    environment: dict[str, Any],
+    inverse: bool,
+) -> None:
+    """Alias phantom loop-body SSA values to the unchanged boundary wire.
+
+    A loop body is traced once even when its specialized range is empty, so
+    later operations can refer to SSA values that the unrolled body never
+    produces. Values sharing a logical quantum identity represent the same
+    unchanged resource in that case. Candidate order follows the lowering
+    direction so forward calls prefer body inputs and inverse calls prefer
+    body outputs.
+
+    Args:
+        operations (list[Operation]): Operations in the zero-trip loop body.
+        environment (dict[str, Any]): Body-local UUID-to-wire mapping to
+            extend with zero-trip aliases.
+        inverse (bool): Whether the surrounding transformed call is lowered
+            in reverse.
+    """
+    values_by_logical_id: dict[str, list[Value]] = {}
+
+    def record(values: Iterable[ValueBase]) -> None:
+        """Collect quantum SSA values in directional preference order.
+
+        Args:
+            values (Iterable[ValueBase]): Values exposed by one operation
+                boundary.
+        """
+        for value in values:
+            if not isinstance(value, Value) or not value.type.is_quantum():
+                continue
+            candidates = values_by_logical_id.setdefault(value.logical_id, [])
+            if all(candidate.uuid != value.uuid for candidate in candidates):
+                candidates.append(value)
+
+    def visit(nested_operations: list[Operation]) -> None:
+        """Collect values recursively from one nested operation sequence.
+
+        Args:
+            nested_operations (list[Operation]): Operation sequence to visit.
+        """
+        sequence = reversed(nested_operations) if inverse else nested_operations
+        for nested_operation in sequence:
+            leading = (
+                list(nested_operation.results)
+                if inverse
+                else nested_operation.all_input_values()
+            )
+            trailing = (
+                nested_operation.all_input_values()
+                if inverse
+                else list(nested_operation.results)
+            )
+            record(leading)
+            if isinstance(nested_operation, HasNestedOps):
+                nested_lists = nested_operation.nested_op_lists()
+                if inverse:
+                    nested_lists = list(reversed(nested_lists))
+                for nested_list in nested_lists:
+                    visit(nested_list)
+            record(trailing)
+
+    visit(operations)
+    for candidates in values_by_logical_id.values():
+        wire = None
+        for candidate in candidates:
+            try:
+                wire = _resolve_wire(candidate, environment)
+            except EmitError:
+                continue
+            break
+        if wire is None:
+            continue
+        for candidate in candidates:
+            environment[candidate.uuid] = wire
+
+
+def _resolve_transformed_power(
+    operation: InvokeOperation | ControlledUOperation | InverseBlockOperation,
+    environment: dict[str, Any],
+) -> int:
+    """Resolve a transformed call's statically known nonnegative power.
+
+    Args:
+        operation (InvokeOperation | ControlledUOperation |
+            InverseBlockOperation): Transformed call being lowered.
+        environment (dict[str, Any]): UUID-to-wire and compile-time value
+            mapping.
+
+    Returns:
+        int: Nonnegative number of complete body applications.
+
+    Raises:
+        EmitError: If a controlled-call power is dynamic or invalid.
+    """
+    if not isinstance(operation, ControlledUOperation):
+        return 1
+    power = operation.power
+    if not isinstance(power, Value):
+        resolved: Any = power
+    elif power.is_constant():
+        resolved = power.get_const()
+    else:
+        resolved = environment.get(f"__index__:{power.uuid}")
+    if resolved is None:
+        raise EmitError(
+            "HUGR transformed call power must be a compile-time nonnegative integer",
+            operation="ControlledUOperation",
+        )
+    try:
+        return coerce_nonnegative_integral(
+            resolved,
+            label="HUGR transformed call power",
+        )
+    except (TypeError, ValueError) as error:
+        raise EmitError(
+            str(error),
+            operation="ControlledUOperation",
+        ) from error
 
 
 def _publish_transformed_result(
@@ -2917,26 +4302,29 @@ def _publish_transformed_result(
     environment: dict[str, Any],
     live_qubits: dict[str, Any],
 ) -> None:
-    """Publish a transformed-call result and its containing array version.
+    """Publish quantum call or cast results and their containing array versions.
 
     Args:
         source (Value | None): Same-resource quantum value consumed by the
             call, or ``None`` when the result has no input lineage.
         result (Value): Quantum SSA value produced by the transformed call.
-        wire (Any): Resulting linear HUGR wire.
+        wire (Any): Resulting linear HUGR wire, or a list for arrays and QInts.
         environment (dict[str, Any]): UUID-to-wire mapping to update.
         live_qubits (dict[str, Any]): Live quantum resource mapping to update.
 
     Raises:
         EmitError: If a result array version cannot be reconstructed.
     """
-    if isinstance(result, ArrayValue):
+    if isinstance(result, ArrayValue) or isinstance(result.type, QUIntType):
         if not isinstance(wire, list):
             raise EmitError(
                 f"HUGR array result {result.name!r} did not produce linear elements"
             )
         source_wires: list[Any] = (
-            _resolve_wire(source, environment) if isinstance(source, ArrayValue) else []
+            _resolve_wire(source, environment)
+            if source is not None
+            and (isinstance(source, ArrayValue) or isinstance(source.type, QUIntType))
+            else []
         )
         if source is not None:
             _replace_environment_aliases(environment, source_wires, wire)
@@ -2950,6 +4338,9 @@ def _publish_transformed_result(
         return
 
     previous = _resolve_wire(source, environment) if source is not None else None
+    for key, live_wire in list(live_qubits.items()):
+        if live_wire == previous:
+            live_qubits.pop(key)
     if source is not None:
         _replace_environment_aliases(environment, previous, wire)
         environment[source.uuid] = wire
@@ -2971,6 +4362,12 @@ def _publish_transformed_result(
             environment[root_uuid] = list(environment[source_address[0]])
         environment[root_uuid][index] = wire
     live_qubits[_quantum_key(result, environment)] = wire
+    if (
+        source is not None
+        and source.parent_array is not None
+        and source.uuid != result.uuid
+    ):
+        environment.pop(source.uuid, None)
 
 
 def _lower_controlled_pauli_evolution(
@@ -3007,9 +4404,11 @@ def _lower_controlled_pauli_evolution(
 
     qubit_operand = operation.qubits
     result = operation.evolved_qubits
-    if not isinstance(qubit_operand, ArrayValue) or not isinstance(result, ArrayValue):
+    source = result if inverse else qubit_operand
+    destination = qubit_operand if inverse else result
+    if not isinstance(source, ArrayValue) or not isinstance(destination, ArrayValue):
         raise EmitError("Controlled HUGR Pauli evolution requires a fixed vector")
-    if qubit_operand.uuid not in environment:
+    if source.uuid not in environment:
         raise EmitError("Controlled HUGR Pauli evolution cannot resolve its vector")
     if operation.observable.is_constant():
         hamiltonian = cast(Any, operation.observable.get_const())
@@ -3020,21 +4419,28 @@ def _lower_controlled_pauli_evolution(
             hamiltonian = environment.get(f"__parameter__:{parameter_name}")
     if not isinstance(hamiltonian, qm_o.Hamiltonian):
         raise EmitError("Controlled HUGR Pauli evolution requires a bound Hamiltonian")
+    _validate_pauli_evolution_hamiltonian(hamiltonian)
 
-    qubits = list(environment[qubit_operand.uuid])
+    qubits = list(environment[source.uuid])
     direction = -1.0 if inverse else 1.0
+    constant_value = float(hamiltonian.constant.real)
+    if constant_value:
+        _lower_global_phase(
+            operation.gamma,
+            builder,
+            environment,
+            scale=-0.5 * direction * constant_value,
+        )
+        rotation = _rotation_wire(
+            builder,
+            operation.gamma,
+            environment,
+            scale=-direction * constant_value,
+        )
+        [control] = builder.add_op(quantum.Rz, control, rotation)
     for operators, coefficient in hamiltonian:
         coefficient_value = float(coefficient.real)
         if is_close_zero(abs(coefficient_value)):
-            continue
-        if not operators:
-            rotation = _rotation_wire(
-                builder,
-                operation.gamma,
-                environment,
-                scale=-direction * coefficient_value,
-            )
-            [control] = builder.add_op(quantum.Rz, control, rotation)
             continue
         selected_indices = [item.index for item in operators]
         if any(index < 0 or index >= len(qubits) for index in selected_indices):
@@ -3083,9 +4489,45 @@ def _lower_controlled_pauli_evolution(
                 [wire] = builder.add_op(quantum.S, wire)
             qubits[item.index] = wire
 
-    environment[qubit_operand.uuid] = qubits
-    environment[result.uuid] = qubits
+    environment[source.uuid] = qubits
+    environment[destination.uuid] = qubits
     return control
+
+
+def _validate_pauli_evolution_hamiltonian(hamiltonian: Any) -> None:
+    """Reject non-Hermitian coefficients before HUGR gate synthesis.
+
+    Args:
+        hamiltonian (Any): Bound Qamomile Hamiltonian.
+
+    Raises:
+        EmitError: If the identity or a Pauli coefficient is non-finite or has
+            a material imaginary component.
+    """
+    from qamomile.observable.hamiltonian import HERMITIAN_IMAG_ATOL
+
+    constant = complex(hamiltonian.constant)
+    if not math.isfinite(constant.real) or not math.isfinite(constant.imag):
+        raise EmitError("HUGR Pauli evolution requires finite Hamiltonian coefficients")
+    if abs(constant.imag) > HERMITIAN_IMAG_ATOL:
+        raise EmitError(
+            "HUGR Pauli evolution requires a Hermitian Hamiltonian; "
+            "the identity coefficient is non-real"
+        )
+    for operators, coefficient in hamiltonian:
+        numeric_coefficient = complex(coefficient)
+        if not math.isfinite(numeric_coefficient.real) or not math.isfinite(
+            numeric_coefficient.imag
+        ):
+            raise EmitError(
+                "HUGR Pauli evolution requires finite Hamiltonian coefficients; "
+                f"found {coefficient} on term {operators}"
+            )
+        if abs(numeric_coefficient.imag) > HERMITIAN_IMAG_ATOL:
+            raise EmitError(
+                "HUGR Pauli evolution requires a Hermitian Hamiltonian; "
+                f"coefficient {coefficient} on term {operators} is non-real"
+            )
 
 
 def _lower_controlled_gate(
@@ -3095,54 +4537,177 @@ def _lower_controlled_gate(
     controls: list[Any],
     inverse: bool,
 ) -> list[Any]:
-    """Legalize one primitive gate under one or two HUGR controls.
+    """Lower a primitive or broadcast gate under coherent controls.
 
     Args:
         operation (GateOperation): Primitive body gate.
         builder (Any): HUGR dataflow builder.
         environment (dict[str, Any]): Body-local wire mapping.
-        controls (list[Any]): Current control wires.
+        controls (list[Any]): Current coherent control wires.
         inverse (bool): Whether to emit the adjoint gate.
 
     Returns:
         list[Any]: Updated linear control wires.
 
     Raises:
-        EmitError: If the controlled primitive is outside the target profile.
+        EmitError: If the primitive or vector layout is unsupported.
+    """
+    sources = operation.results if inverse else operation.qubit_operands
+    destinations = operation.qubit_operands if inverse else operation.results
+    targets = [_resolve_wire(source, environment) for source in sources]
+    if any(isinstance(wire, list) for wire in targets):
+        if len(targets) != 1 or not isinstance(targets[0], list):
+            raise EmitError("HUGR supports only unary broadcast controlled array gates")
+        outputs = []
+        for wire in targets[0]:
+            controls, updated = _lower_controlled_primitive(
+                operation, builder, environment, controls, [wire], inverse
+            )
+            outputs.extend(updated)
+        result_wires = [outputs]
+    else:
+        controls, result_wires = _lower_controlled_primitive(
+            operation, builder, environment, controls, targets, inverse
+        )
+    for source, destination, previous, wire in zip(
+        sources, destinations, targets, result_wires, strict=True
+    ):
+        if isinstance(destination, ArrayValue):
+            _publish_transformed_result(source, destination, wire, environment, {})
+            continue
+        _replace_environment_aliases(environment, previous, wire)
+        environment[destination.uuid] = wire
+        address = _array_address(destination, environment)
+        if address is not None:
+            root_uuid, index = address
+            environment[root_uuid][index] = wire
+            if source.uuid != destination.uuid:
+                environment.pop(source.uuid, None)
+        else:
+            environment[source.uuid] = wire
+    return controls
+
+
+def _lower_controlled_primitive(
+    operation: GateOperation,
+    builder: Any,
+    environment: dict[str, Any],
+    controls: list[Any],
+    targets: list[Any],
+    inverse: bool,
+) -> tuple[list[Any], list[Any]]:
+    """Synthesize controlled primitives with TKET gates and clean conjunctions.
+
+    Args:
+        operation (GateOperation): Primitive gate and optional radian angle.
+        builder (Any): HUGR dataflow builder.
+        environment (dict[str, Any]): Classical parameter wire mapping.
+        controls (list[Any]): Nonempty coherent controls.
+        targets (list[Any]): Scalar target wires in gate operand order.
+        inverse (bool): Whether to emit the adjoint primitive.
+
+    Returns:
+        tuple[list[Any], list[Any]]: Updated control and target wires.
+
+    Raises:
+        EmitError: If the primitive gate type is unsupported.
     """
     from tket_exts import quantum
 
-    if len(operation.qubit_operands) != 1:
-        raise EmitError("Nested controlled multi-qubit HUGR gates are unsupported")
-    target_value = operation.qubit_operands[0]
-    target = _resolve_wire(target_value, environment)
-    if operation.gate_type is GateOperationType.X:
-        if len(controls) == 1:
-            controls[0], target = builder.add_op(quantum.CX, controls[0], target)
-        elif len(controls) == 2:
-            controls[0], controls[1], target = builder.add_op(
-                quantum.toffoli, controls[0], controls[1], target
-            )
-        else:
-            raise EmitError("HUGR controlled X supports one or two controls")
-    elif operation.gate_type is GateOperationType.Y and len(controls) == 1:
-        controls[0], target = builder.add_op(quantum.CY, controls[0], target)
-    elif operation.gate_type is GateOperationType.Z and len(controls) == 1:
-        controls[0], target = builder.add_op(quantum.CZ, controls[0], target)
-    elif operation.gate_type is GateOperationType.RZ and len(controls) == 1:
-        assert operation.theta is not None
-        rotation = _rotation_wire(
-            builder,
-            operation.theta,
-            environment,
-            scale=-1.0 if inverse else 1.0,
+    gate = operation.gate_type
+    if gate is GateOperationType.Z and len(controls) == len(targets) == 1:
+        control, target = builder.add_op(quantum.CZ, controls[0], targets[0])
+        return [control], [target]
+    phase_angles = {
+        GateOperationType.Z: math.pi,
+        GateOperationType.S: math.pi / 2,
+        GateOperationType.SDG: -math.pi / 2,
+        GateOperationType.T: math.pi / 4,
+        GateOperationType.TDG: -math.pi / 4,
+    }
+    if gate in phase_angles or gate in {
+        GateOperationType.P,
+        GateOperationType.CP,
+        GateOperationType.CZ,
+    }:
+        phase = operation.theta
+        if phase is None:
+            phase = cast(Value, _literal_value(phase_angles.get(gate, math.pi)))
+        wires = _lower_phase_on_controls(
+            phase, builder, environment, [*controls, *targets], -1.0 if inverse else 1.0
         )
-        controls[0], target = builder.add_op(quantum.CRz, controls[0], target, rotation)
+        return wires[: len(controls)], wires[len(controls) :]
+    if gate in {GateOperationType.CX, GateOperationType.TOFFOLI}:
+        body = dataclasses.replace(operation, gate_type=GateOperationType.X)
+        wires, output = _lower_controlled_primitive(
+            body,
+            builder,
+            environment,
+            [*controls, *targets[:-1]],
+            [targets[-1]],
+            inverse,
+        )
+        return wires[: len(controls)], [*wires[len(controls) :], *output]
+    if gate is GateOperationType.SWAP:
+        left, right = targets
+        body = dataclasses.replace(operation, gate_type=GateOperationType.X)
+        for _ in range(3):
+            wires, [right] = _lower_controlled_primitive(
+                body, builder, environment, [*controls, left], [right], inverse
+            )
+            controls, left = wires[:-1], wires[-1]
+            left, right = right, left
+        return controls, [right, left]
+    if gate is GateOperationType.RZZ:
+        left, right = builder.add_op(quantum.CX, *targets)
+        body = dataclasses.replace(operation, gate_type=GateOperationType.RZ)
+        controls, [right] = _lower_controlled_primitive(
+            body, builder, environment, controls, [right], inverse
+        )
+        left, right = builder.add_op(quantum.CX, left, right)
+        return controls, [left, right]
+    if len(targets) != 1:
+        raise EmitError("HUGR controlled primitive target arity mismatch")
+    target = targets[0]
+    if gate is GateOperationType.X and len(controls) == 2:
+        left, right, target = builder.add_op(quantum.toffoli, *controls, target)
+        return [left, right], [target]
+    if len(controls) > 1:
+        updated, ancillas = _compute_control_conjunction(builder, controls)
+        [ancillas[-1]], targets = _lower_controlled_primitive(
+            operation, builder, environment, [ancillas[-1]], targets, inverse
+        )
+        return _uncompute_control_conjunction(builder, updated, ancillas), targets
+    control = controls[0]
+    if gate in {GateOperationType.X, GateOperationType.Y}:
+        native = quantum.CX if gate is GateOperationType.X else quantum.CY
+        control, target = builder.add_op(native, control, target)
+    elif gate is GateOperationType.H:
+        angle = cast(Value, _literal_value(math.pi / 4))
+        [target] = builder.add_op(
+            quantum.Ry, target, _rotation_wire(builder, angle, environment, scale=-1.0)
+        )
+        control, target = builder.add_op(quantum.CZ, control, target)
+        [target] = builder.add_op(
+            quantum.Ry, target, _rotation_wire(builder, angle, environment)
+        )
+    elif gate in {GateOperationType.RX, GateOperationType.RY, GateOperationType.RZ}:
+        assert operation.theta is not None
+        if gate is GateOperationType.RY:
+            [target] = builder.add_op(quantum.Sdg, target)
+        if gate is not GateOperationType.RZ:
+            [target] = builder.add_op(quantum.H, target)
+        rotation = _rotation_wire(
+            builder, operation.theta, environment, scale=-1.0 if inverse else 1.0
+        )
+        control, target = builder.add_op(quantum.CRz, control, target, rotation)
+        if gate is not GateOperationType.RZ:
+            [target] = builder.add_op(quantum.H, target)
+        if gate is GateOperationType.RY:
+            [target] = builder.add_op(quantum.S, target)
     else:
-        raise EmitError(f"Unsupported controlled HUGR gate: {operation.gate_type}")
-    environment[operation.results[0].uuid] = target
-    environment[target_value.uuid] = target
-    return controls
+        raise EmitError(f"Unsupported controlled HUGR gate: {gate}")
+    return [control], [target]
 
 
 def _lower_binop(
@@ -3160,8 +4725,21 @@ def _lower_binop(
     Raises:
         EmitError: If operand types or operation kind are unsupported.
     """
-    if operation.kind is None:
+    kind = operation.kind
+    if kind is None:
         raise EmitError("HUGR arithmetic operation has no operation kind")
+    if any(isinstance(value.type, FloatType) for value in operation.operands):
+        promoted = []
+        for value in operation.operands:
+            concrete = (
+                value.get_const()
+                if value.is_constant()
+                else environment.get(f"__index__:{value.uuid}")
+            )
+            if isinstance(value.type, UIntType) and isinstance(concrete, int):
+                value = Value(type=FloatType(), name="").with_const(float(concrete))
+            promoted.append(value)
+        operation = dataclasses.replace(operation, operands=promoted)
     if all(isinstance(value.type, FloatType) for value in operation.operands):
         from hugr import tys
         from hugr.std.float import FLOAT_OPS_EXTENSION, FLOAT_T
@@ -3182,7 +4760,9 @@ def _lower_binop(
         )
     elif all(isinstance(value.type, UIntType) for value in operation.operands):
         from hugr import tys
-        from hugr.std.int import INT_OPS_EXTENSION, INT_T, IntVal
+        from hugr.std.int import INT_OPS_EXTENSION
+
+        INT_T = _hugr_uint_type()
 
         concrete = []
         for value in operation.operands:
@@ -3207,7 +4787,7 @@ def _lower_binop(
                     raise EmitError(
                         f"Unsupported HUGR arithmetic operation: {operation.kind}"
                     )
-            [wire] = builder.load(IntVal(value))
+            [wire] = builder.load(_hugr_uint_value(value))
             result = operation.results[0]
             environment[result.uuid] = wire
             environment[f"__index__:{result.uuid}"] = value
@@ -3219,14 +4799,14 @@ def _lower_binop(
             BinOpKind.POW: "ipow",
         }
         extension = INT_OPS_EXTENSION
-        arguments = [tys.BoundedNatArg(5)]
+        arguments = [tys.BoundedNatArg(6)]
         concrete_signature = tys.FunctionType(
             [INT_T, INT_T],
             [INT_T],
         )
     else:
         raise EmitError("HUGR arithmetic operands must share Float or UInt type")
-    name = names.get(operation.kind)
+    name = names.get(kind)
     if name is None:
         raise EmitError(f"Unsupported HUGR arithmetic operation: {operation.kind}")
     op = extension.get_op(name).instantiate(
@@ -3247,7 +4827,11 @@ def _lower_compop(
     builder: Any,
     environment: dict[str, Any],
 ) -> None:
-    """Lower Float and UInt comparisons to matching HUGR extensions.
+    """Lower Boolean and numeric comparisons to HUGR extensions.
+
+    Mixed operands stay abstract in Qamomile IR. This target converts a Bit to
+    the UInt width only for mixed equality, or a UInt to Float only for mixed
+    numeric comparisons, immediately before selecting the target operation.
 
     Args:
         operation (CompOp): Qamomile comparison operation.
@@ -3259,47 +4843,107 @@ def _lower_compop(
     """
     if operation.kind is None:
         raise EmitError("HUGR comparison has no comparison kind")
-    if all(isinstance(value.type, FloatType) for value in operation.operands):
-        from hugr.std.float import FLOAT_OPS_EXTENSION
 
-        names = {
-            CompOpKind.EQ: "feq",
-            CompOpKind.NEQ: "fne",
-            CompOpKind.LT: "flt",
-            CompOpKind.LE: "fle",
-            CompOpKind.GT: "fgt",
-            CompOpKind.GE: "fge",
-        }
-        extension = FLOAT_OPS_EXTENSION
-        arguments: list[Any] = []
-        concrete_signature = None
+    operands = [
+        _resolve_classical_argument(value, builder, environment)
+        for value in operation.operands
+    ]
+
+    if all(isinstance(value.type, BitType) for value in operation.operands):
+        import tket_exts
+
+        name = _BIT_COMPARISON_NAMES.get(operation.kind)
+        if name is None:
+            raise EmitError("HUGR Bit comparisons support only equality and inequality")
+        extension = tket_exts.bool()
+        [left] = builder.add_op(
+            extension.get_op("make_opaque").instantiate(),
+            operands[0],
+        )
+        [right] = builder.add_op(
+            extension.get_op("make_opaque").instantiate(),
+            operands[1],
+        )
+        [opaque_result] = builder.add_op(
+            extension.get_op(name).instantiate(),
+            left,
+            right,
+        )
+        [wire] = builder.add_op(
+            extension.get_op("read").instantiate(),
+            opaque_result,
+        )
     elif all(isinstance(value.type, UIntType) for value in operation.operands):
         from hugr import tys
-        from hugr.std.int import INT_OPS_EXTENSION, INT_T
+        from hugr.std.int import INT_OPS_EXTENSION
 
-        names = {
-            CompOpKind.EQ: "ieq",
-            CompOpKind.NEQ: "ine",
-            CompOpKind.LT: "ilt_u",
-            CompOpKind.LE: "ile_u",
-            CompOpKind.GT: "igt_u",
-            CompOpKind.GE: "ige_u",
-        }
-        extension = INT_OPS_EXTENSION
-        arguments = [tys.BoundedNatArg(5)]
-        concrete_signature = tys.FunctionType([INT_T, INT_T], [tys.Bool])
+        INT_T = _hugr_uint_type()
+
+        name = _UINT_COMPARISON_NAMES.get(operation.kind)
+        if name is None:
+            raise EmitError(f"Unsupported HUGR UInt comparison: {operation.kind}")
+        comparison = INT_OPS_EXTENSION.get_op(name).instantiate(
+            list(INT_T.args),
+            concrete_signature=tys.FunctionType([INT_T, INT_T], [tys.Bool]),
+        )
+        [wire] = builder.add_op(comparison, *operands)
+    elif all(
+        isinstance(value.type, (BitType, UIntType)) for value in operation.operands
+    ):
+        from hugr import tys
+        from hugr.std.int import (
+            CONVERSIONS_EXTENSION,
+            INT_OPS_EXTENSION,
+            int_t,
+        )
+
+        name = _UINT_COMPARISON_NAMES.get(operation.kind)
+        if name not in {"ieq", "ine"}:
+            raise EmitError(
+                "HUGR Bit and UInt comparisons support only equality and inequality"
+            )
+        INT_T = _hugr_uint_type()
+        bit_int_type = int_t(0)
+        converted = []
+        for value, operand in zip(operation.operands, operands, strict=True):
+            if isinstance(value.type, BitType):
+                from_bool = CONVERSIONS_EXTENSION.get_op("ifrombool").instantiate()
+                [operand] = builder.add_op(from_bool, operand)
+                widen = INT_OPS_EXTENSION.get_op("iwiden_u").instantiate(
+                    [*bit_int_type.args, *INT_T.args],
+                    concrete_signature=tys.FunctionType([bit_int_type], [INT_T]),
+                )
+                [operand] = builder.add_op(widen, operand)
+            converted.append(operand)
+        comparison = INT_OPS_EXTENSION.get_op(name).instantiate(
+            list(INT_T.args),
+            concrete_signature=tys.FunctionType([INT_T, INT_T], [tys.Bool]),
+        )
+        [wire] = builder.add_op(comparison, *converted)
+    elif all(
+        isinstance(value.type, (UIntType, FloatType)) for value in operation.operands
+    ):
+        from hugr import tys
+        from hugr.std.float import FLOAT_OPS_EXTENSION, FLOAT_T
+        from hugr.std.int import CONVERSIONS_EXTENSION
+
+        INT_T = _hugr_uint_type()
+
+        converted = []
+        for value, operand in zip(operation.operands, operands, strict=True):
+            if isinstance(value.type, UIntType):
+                conversion = CONVERSIONS_EXTENSION.get_op("convert_u").instantiate(
+                    list(INT_T.args),
+                    concrete_signature=tys.FunctionType([INT_T], [FLOAT_T]),
+                )
+                [operand] = builder.add_op(conversion, operand)
+            converted.append(operand)
+        name = _FLOAT_COMPARISON_NAMES.get(operation.kind)
+        if name is None:
+            raise EmitError(f"Unsupported HUGR numeric comparison: {operation.kind}")
+        comparison = FLOAT_OPS_EXTENSION.get_op(name).instantiate()
+        [wire] = builder.add_op(comparison, *converted)
     else:
-        raise EmitError("HUGR comparison operands must share Float or UInt type")
-    name = names.get(operation.kind)
-    if name is None:
-        raise EmitError(f"Unsupported HUGR comparison: {operation.kind}")
-    op = extension.get_op(name).instantiate(
-        arguments,
-        concrete_signature=concrete_signature,
-    )
-    [wire] = builder.add_op(
-        op,
-        _resolve_classical_argument(operation.operands[0], builder, environment),
-        _resolve_classical_argument(operation.operands[1], builder, environment),
-    )
+        raise EmitError("HUGR comparison operands must both be Bit or numeric handles")
+
     environment[operation.results[0].uuid] = wire

@@ -35,7 +35,7 @@
 
 # %%
 # Install the latest Qamomile through pip!
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit,visualization]"
 
 # %% [markdown]
 # ## What is MaxCut?
@@ -66,6 +66,8 @@
 # non-trivial, yet small enough to brute-force for comparison.
 
 # %%
+import os
+
 import matplotlib.pyplot as plt
 import networkx as nx
 
@@ -224,11 +226,8 @@ def superposition(n: qmc.UInt) -> qmc.Vector[qmc.Qubit]:
 # Qamomile's rotation gates include a $1/2$ factor:
 # $\text{RZ}(\theta) = e^{-i \theta Z / 2}$ and
 # $\text{RZZ}(\theta) = e^{-i \theta Z \otimes Z / 2}$.
-# To match $e^{-i \gamma H_C}$ exactly one would pass $2 J_{ij} \gamma$
-# as the angle. However, since $\gamma$ is a **variational parameter**
-# that the classical optimizer tunes freely, this constant factor is
-# simply absorbed into the optimal $\gamma$ values. We therefore pass
-# $J_{ij} \cdot \gamma$ (and $h_i \cdot \gamma$) directly.
+# To match $e^{-i \gamma H_C}$ exactly, we therefore pass
+# $2 J_{ij} \gamma$ to `rzz` and $2 h_i \gamma$ to `rz`.
 #
 # We keep the `linear` argument even though it is empty for unweighted
 # MaxCut — this makes the kernel immediately reusable for weighted MaxCut
@@ -244,9 +243,9 @@ def cost_layer(
     gamma: qmc.Float,
 ) -> qmc.Vector[qmc.Qubit]:
     for (i, j), Jij in quad.items():
-        q[i], q[j] = qmc.rzz(q[i], q[j], angle=Jij * gamma)
+        q[i], q[j] = qmc.rzz(q[i], q[j], angle=2.0 * Jij * gamma)
     for i, hi in linear.items():
-        q[i] = qmc.rz(q[i], angle=hi * gamma)
+        q[i] = qmc.rz(q[i], angle=2.0 * hi * gamma)
     return q
 
 
@@ -305,7 +304,8 @@ def qaoa_ansatz(
 from qamomile.qiskit import QiskitTranspiler
 
 transpiler = QiskitTranspiler()
-p = 3  # number of QAOA layers
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+p = 1 if docs_test_mode else 3  # number of QAOA layers
 
 executable = transpiler.transpile(
     qaoa_ansatz,
@@ -333,8 +333,6 @@ executable = transpiler.transpile(
 # drop it (or only enable it in tests / docs builds).
 
 # %%
-import os
-
 import numpy as np
 from qiskit_aer import AerSimulator
 from scipy.optimize import minimize
@@ -348,9 +346,8 @@ def make_seeded_backend() -> AerSimulator:
 
 
 executor = transpiler.executor(backend=make_seeded_backend())
-docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-sample_shots = 256 if docs_test_mode else 2048
-maxiter = 20 if docs_test_mode else 500
+sample_shots = 1 if docs_test_mode else 2048
+maxiter = 4 if docs_test_mode else 500
 cost_history: list[float] = []
 
 

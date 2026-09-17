@@ -1,8 +1,9 @@
-"""Shared materialization boundary for circuit-family backend artifacts."""
+"""Shared materialization boundary for circuit-family engine artifacts."""
 
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from collections.abc import Mapping
 from typing import Any, Generic, Protocol, TypeVar
 
@@ -30,11 +31,11 @@ ArtifactT = TypeVar("ArtifactT")
 
 @dataclasses.dataclass(frozen=True)
 class MaterializedCircuit(Generic[ArtifactT]):
-    """Package a circuit artifact and backend-specific binding metadata.
+    """Package a circuit artifact and engine-specific binding metadata.
 
     Args:
-        artifact (Any): Backend-native circuit object.
-        parameters (Mapping[str, Any]): Backend parameters keyed by public
+        artifact (Any): Engine-native circuit object.
+        parameters (Mapping[str, Any]): Engine parameters keyed by public
             parameter name.
         measurement_qubit_map (Mapping[int, int] | None): Static-measurement
             mapping from classical output slot to physical qubit slot. ``None``
@@ -42,16 +43,21 @@ class MaterializedCircuit(Generic[ArtifactT]):
             explicit override.
         parameter_order (tuple[str, ...] | None): Artifact ABI order for
             positional parameters. ``None`` denotes name-based binding.
+        implicit_output_qubit_indices (tuple[int, ...] | None): Physical qubit
+            indices exposed when a qkernel has no explicit return value.
+            ``None`` preserves the executor's full raw bitstring; an empty
+            tuple explicitly exposes no qubits.
     """
 
     artifact: ArtifactT
     parameters: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     measurement_qubit_map: Mapping[int, int] | None = None
     parameter_order: tuple[str, ...] | None = None
+    implicit_output_qubit_indices: tuple[int, ...] | None = None
 
 
 class CircuitMaterializer(Protocol[ArtifactT]):
-    """Convert one target-legal circuit program to a backend artifact.
+    """Convert one target-legal circuit program to an engine artifact.
 
     A materializer owns two things: a declaration of what it accepts
     (:attr:`capabilities`) and a mechanical conversion of programs that
@@ -70,29 +76,32 @@ class CircuitMaterializer(Protocol[ArtifactT]):
         """
         ...
 
-    def materialize(self, program: CircuitProgram) -> MaterializedCircuit[ArtifactT]:
+    def materialize(
+        self,
+        program: CircuitProgram,
+    ) -> MaterializedCircuit[ArtifactT]:
         """Materialize one circuit program.
 
         Args:
             program (CircuitProgram): Target-legal circuit-family program.
 
         Returns:
-            MaterializedCircuit: Artifact plus backend binding metadata.
+            MaterializedCircuit: Artifact plus engine binding metadata.
         """
         ...
 
 
-class CircuitBackendEmitPass(EmitPass[ArtifactT]):
+class CircuitEngineEmitPass(EmitPass[ArtifactT]):
     """Lower, legalize, verify, and materialize a circuit-family plan.
 
     The pass runs the three phases in order and never interleaves them:
-    shared lowering produces backend-neutral circuit IR, target legalization
+    shared lowering produces engine-neutral circuit IR, target legalization
     rewrites it under the materializer's declared capabilities and the
     compilation policy, target verification proves the result, and only then
     does the materializer convert it mechanically.
 
     Args:
-        materializer (CircuitMaterializer[ArtifactT]): Backend artifact
+        materializer (CircuitMaterializer[ArtifactT]): Engine artifact
             materializer owning the target capability declaration.
         bindings (dict[str, Any] | None): Compile-time bindings. Defaults to
             ``None``.
@@ -112,7 +121,7 @@ class CircuitBackendEmitPass(EmitPass[ArtifactT]):
         """Initialize a circuit-family lowering and materialization pass.
 
         Args:
-            materializer (CircuitMaterializer[ArtifactT]): Backend artifact
+            materializer (CircuitMaterializer[ArtifactT]): Engine artifact
                 materializer owning the target capability declaration.
             bindings (dict[str, Any] | None): Compile-time bindings. Defaults
                 to ``None``.
@@ -133,7 +142,7 @@ class CircuitBackendEmitPass(EmitPass[ArtifactT]):
             input (ProgramPlan): Circuit-family execution plan.
 
         Returns:
-            ExecutableProgram[ArtifactT]: Backend-native executable structure.
+            ExecutableProgram[ArtifactT]: Engine-native executable structure.
 
         Raises:
             TargetCapabilityError: If a legalized segment still requires a
@@ -176,7 +185,7 @@ class CircuitBackendEmitPass(EmitPass[ArtifactT]):
             RuntimeError: Always, because :meth:`run` owns the new path.
         """
         del operations, bindings
-        raise RuntimeError("Circuit backends must materialize CircuitProgram")
+        raise RuntimeError("Circuit engines must materialize CircuitProgram")
 
 
 def materialize_executable(
@@ -188,18 +197,22 @@ def materialize_executable(
     Args:
         executable (ExecutableProgram[CircuitProgram]): Lowered circuit-family
             execution structure.
-        materializer (CircuitMaterializer[ArtifactT]): Backend materializer.
+        materializer (CircuitMaterializer[ArtifactT]): Engine materializer.
 
     Returns:
         ExecutableProgram[ArtifactT]: Execution structure containing native
-            backend circuits and unchanged ABI, classical, expectation-value,
+            engine circuits and unchanged ABI, classical, expectation-value,
             mapping, and parameter metadata.
     """
     quantum_segments = []
     for segment in executable.compiled_quantum:
-        materialized = materializer.materialize(segment.circuit)
         metadata_names = tuple(
             parameter.name for parameter in segment.parameter_metadata.parameters
+        )
+        materialized = _materialize_segment(
+            materializer,
+            segment.circuit,
+            metadata_names,
         )
         materialized_names = tuple(materialized.parameters)
         if set(materialized_names) != set(metadata_names):
@@ -221,9 +234,9 @@ def materialize_executable(
             parameters=[
                 dataclasses.replace(
                     parameter,
-                    backend_param=materialized.parameters.get(
+                    engine_param=materialized.parameters.get(
                         parameter.name,
-                        parameter.backend_param,
+                        parameter.engine_param,
                     ),
                 )
                 for parameter in segment.parameter_metadata.parameters
@@ -240,6 +253,11 @@ def materialize_executable(
                     if materialized.measurement_qubit_map is None
                     else dict(materialized.measurement_qubit_map)
                 ),
+                implicit_output_qubit_indices=(
+                    segment.implicit_output_qubit_indices
+                    if materialized.implicit_output_qubit_indices is None
+                    else materialized.implicit_output_qubit_indices
+                ),
                 parameter_metadata=parameter_metadata,
             )
         )
@@ -250,3 +268,33 @@ def materialize_executable(
         compiled_expval=executable.compiled_expval,
         output_values=list(executable.output_values),
     )
+
+
+def _materialize_segment(
+    materializer: CircuitMaterializer[ArtifactT],
+    program: CircuitProgram,
+    parameter_names: tuple[str, ...],
+) -> MaterializedCircuit[ArtifactT]:
+    """Call a current or legacy circuit-materializer signature.
+
+    Args:
+        materializer (CircuitMaterializer[ArtifactT]): Target materializer.
+        program (CircuitProgram): Verified target-legal program.
+        parameter_names (tuple[str, ...]): Runtime parameter ABI order.
+
+    Returns:
+        MaterializedCircuit[ArtifactT]: Materialized artifact and metadata.
+    """
+    method = materializer.materialize
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    supports_parameter_names = any(
+        parameter.name == "parameter_names"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_parameter_names:
+        return method(program, parameter_names=parameter_names)  # type: ignore[call-arg]
+    return method(program)

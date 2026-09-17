@@ -1,4 +1,4 @@
-"""Emit pass: Generate backend-specific code from separated program."""
+"""Emit pass: Generate engine-specific code from separated program."""
 
 from __future__ import annotations
 
@@ -11,6 +11,14 @@ from qamomile.circuit.ir.operation.callable import (
     CompositeGateType,
     InvokeOperation,
 )
+from qamomile.circuit.ir.operation.gate import (
+    MeasureOperation,
+    MeasureQFixedOperation,
+    MeasureQIntOperation,
+    MeasureVectorOperation,
+    ProjectOperation,
+    ResetOperation,
+)
 from qamomile.circuit.ir.types.primitives import BitType
 from qamomile.circuit.ir.value import (
     ArrayValue,
@@ -21,6 +29,7 @@ from qamomile.circuit.ir.value import (
     collect_value_like_uuids,
     resolve_root_qubit_address,
 )
+from qamomile.circuit.transpiler.errors import EmitError
 from qamomile.circuit.transpiler.executable import (
     CompiledClassicalSegment,
     CompiledExpvalSegment,
@@ -29,6 +38,7 @@ from qamomile.circuit.transpiler.executable import (
     ParameterMetadata,
 )
 from qamomile.circuit.transpiler.passes import Pass
+from qamomile.circuit.transpiler.passes.control_flow_visitor import OperationCollector
 from qamomile.circuit.transpiler.passes.emit_support.condition_resolution import (
     resolve_condition_address_detailed,
 )
@@ -50,7 +60,7 @@ from qamomile.circuit.transpiler.segments import (
     QuantumStep,
 )
 
-T = TypeVar("T")  # Backend circuit type
+T = TypeVar("T")  # Engine circuit type
 C = TypeVar("C", contravariant=True)  # Circuit type for emitter
 
 
@@ -61,7 +71,7 @@ class CompositeGateEmitter(Protocol[C]):
     The concrete compiler installs a semantic emitter that boxes every
     executable callable into circuit IR with its identity and fallback body.
     Native SDK selection happens later, through target capabilities and
-    legalization; this traversal hook must not import or select a backend.
+    legalization; this traversal hook must not import or select an engine.
     """
 
     def can_emit(self, gate_type: CompositeGateType) -> bool:
@@ -98,10 +108,10 @@ class CompositeGateEmitter(Protocol[C]):
 
 
 class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
-    """Base class for backend-specific emission passes.
+    """Base class for engine-specific emission passes.
 
     Subclasses implement _emit_quantum_segment() to generate
-    backend-specific quantum circuits.
+    engine-specific quantum circuits.
 
     Input: ProgramPlan
     Output: ExecutableProgram with compiled segments
@@ -121,7 +131,7 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
         Args:
             bindings: Values to bind parameters to. If not provided,
                      parameters must be bound at execution time.
-            parameters: List of parameter names to preserve as backend parameters.
+            parameters: List of parameter names to preserve as engine parameters.
 
         Raises:
             ValueError: If a name appears in both ``bindings`` and
@@ -156,7 +166,7 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
         self._resolver = ValueResolver(self.parameters)
 
     def run(self, input: ProgramPlan) -> ExecutableProgram[T]:
-        """Emit backend code from a program plan.
+        """Emit engine code from a program plan.
 
         Args:
             input (ProgramPlan): Segmented plan whose quantum and classical
@@ -165,7 +175,22 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
         Returns:
             ExecutableProgram[T]: Executable program containing all compiled
                 segments and the public output contract.
+
+        Raises:
+            EmitError: If expectation-value evaluation is combined with a
+                measurement, projection, or reset operation, or if a planned
+                segment cannot be emitted.
         """
+        # ``Block.parameters`` includes special values such as Observable
+        # inputs even when they are supplied as compile-time bindings. The
+        # public bindings/parameters disjointness check has already rejected
+        # genuine user overlap; subtract bound manifest entries here so only
+        # unbound symbols are promoted into the engine runtime ABI.
+        planned_parameters = set(input.parameters) - set(self.bindings)
+        if not planned_parameters.issubset(self.parameters):
+            self.parameters.update(planned_parameters)
+            self._resolver = ValueResolver(self.parameters)
+
         self._program_output_values = tuple(input.abi.output_values)
         self._program_output_refs = frozenset(
             uuid
@@ -178,6 +203,34 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
         compiled_expval: list[CompiledExpvalSegment] = []
         expval_segments: list[ExpvalSegment] = []
         compiled_quantum: list[CompiledQuantumSegment[T]] = []
+
+        if any(isinstance(step, ExpvalStep) for step in input.steps):
+            nonunitary_types = (
+                MeasureOperation,
+                MeasureQFixedOperation,
+                MeasureQIntOperation,
+                MeasureVectorOperation,
+                ProjectOperation,
+                ResetOperation,
+            )
+            for step in input.steps:
+                if not isinstance(step, QuantumStep):
+                    continue
+                collector = OperationCollector(
+                    lambda operation: isinstance(operation, nonunitary_types)
+                )
+                collector.visit_operations(step.segment.operations)
+                if collector.collected:
+                    operation_names = sorted(
+                        {type(operation).__name__ for operation in collector.collected}
+                    )
+                    raise EmitError(
+                        "Programs that compute expval cannot also contain "
+                        "measurement, projection, or reset operations in the "
+                        "same quantum execution. Split sampling and expectation "
+                        "evaluation into separate kernels. Found: "
+                        f"{operation_names}."
+                    )
 
         for step in input.steps:
             if isinstance(step, ClassicalStep):
@@ -209,7 +262,7 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
         self,
         segment: QuantumSegment,
     ) -> CompiledQuantumSegment[T]:
-        """Compile a quantum segment to a backend circuit.
+        """Compile a quantum segment to an engine circuit.
 
         Args:
             segment (QuantumSegment): Segment whose operations and live
@@ -445,6 +498,18 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
             quantum_segment_index,
             compiled_quantum,
         )
+        observable_indices = {
+            operator.index
+            for operators, _coefficient in hamiltonian
+            for operator in operators
+        }
+        invalid_indices = sorted(observable_indices.difference(qubit_map))
+        if invalid_indices:
+            raise ValueError(
+                "Observable qubit indices are outside the register passed to "
+                f"expval: {invalid_indices}. Valid logical indices are "
+                f"{sorted(qubit_map)}."
+            )
 
         # Create CompiledExpvalSegment with qm_o.Hamiltonian directly
         return CompiledExpvalSegment(
@@ -542,7 +607,7 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
                 # Sliced view: let ``EmitError`` propagate.  Catching
                 # here used to silently downgrade the lookup to the
                 # element_uuid path, which then produced an empty
-                # qubit_map and a backend-side observable / circuit
+                # qubit_map and an engine-side observable / circuit
                 # width mismatch far away from the real cause.  When
                 # slice bounds genuinely cannot be resolved under the
                 # active bindings the user needs the EmitError that
@@ -552,24 +617,15 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
                 )
 
             if root_av is qubits_value:
-                # Non-view case: match legacy direct element_uuid lookup
-                # so arrays whose elements were registered under explicit
-                # UUIDs (e.g. tuple-packed expval qubits) still resolve.
-                #
-                # On a miss, fall back to the element's root
-                # ``(root_uuid, index)`` address captured at trace time: the
-                # root array's QInitOperation always registers that composite
-                # key, so this resolves a Vector element whose own (per-version)
-                # UUID was never registered in the quantum segment -- e.g. an
-                # ungated ancilla, or an element that is a gate/composite
-                # result.  Standalone qubits carry the ``("", -1)`` sentinel
-                # (``None`` here) and stay on the flat-lookup path above.
+                # A recorded root address is the canonical physical identity
+                # for an array element, so resolve it before the per-version
+                # element UUID. This prevents stale or inconsistent flat UUID
+                # metadata from silently redirecting an observable. Standalone
+                # qubits carry the ``("", -1)`` sentinel (``None`` here) and
+                # use the flat lookup. If a valid root is absent from an older
+                # segment map, the flat UUID remains a compatibility fallback.
                 parent_addrs = qubits_value.get_element_parent_addresses()
                 for i, qubit_uuid in enumerate(qubits_value.get_element_uuids()):
-                    addr = QubitAddress(qubit_uuid)
-                    if addr in uuid_to_physical:
-                        qubit_map[i] = uuid_to_physical[addr]
-                        continue
                     # ``get_element_parent_addresses()`` returns exactly one
                     # entry per ``get_element_uuids()`` element, so indexing by
                     # ``i`` here is always in range.
@@ -579,6 +635,10 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
                         root_addr = QubitAddress(root_uuid, root_idx)
                         if root_addr in uuid_to_physical:
                             qubit_map[i] = uuid_to_physical[root_addr]
+                            continue
+                    addr = QubitAddress(qubit_uuid)
+                    if addr in uuid_to_physical:
+                        qubit_map[i] = uuid_to_physical[addr]
 
                 # Whole Vector[Qubit] operands created by
                 # ``qubit_array(...)`` do not carry explicit
@@ -635,7 +695,7 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
         operations: list[Operation],
         bindings: dict[str, Any],
     ) -> tuple[T, QubitMap, ClbitMap]:
-        """Generate backend-specific quantum circuit.
+        """Generate engine-specific quantum circuit.
 
         Args:
             operations: List of quantum operations to emit
@@ -643,7 +703,7 @@ class EmitPass(Pass[ProgramPlan, ExecutableProgram[T]], Generic[T]):
 
         Returns:
             Tuple of (circuit, qubit_map, clbit_map) where:
-            - circuit: Backend-specific circuit object
+            - circuit: Engine-specific circuit object
             - qubit_map: Value UUID -> physical qubit index
             - clbit_map: Value UUID -> physical clbit index
         """

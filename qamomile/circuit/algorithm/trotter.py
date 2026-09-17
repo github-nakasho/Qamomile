@@ -56,6 +56,11 @@ from __future__ import annotations
 from typing import Sequence
 
 import qamomile.circuit as qmc
+from qamomile.circuit.frontend.qkernel_callable import qkernel_callable_attrs
+from qamomile.circuit.ir._resource_contract import (
+    ProductFormulaContract,
+    merge_product_formula_contract,
+)
 from qamomile.observable import Hamiltonian
 
 
@@ -113,6 +118,24 @@ def _trotter_evolve(
     for _ in qmc.range(step):
         q = _suzuki_trotter_step(q, hamiltonian, order, dt)
     return q
+
+
+_trotter_evolve = _trotter_evolve._clone_with_callable_attrs(
+    merge_product_formula_contract(
+        qkernel_callable_attrs(_trotter_evolve),
+        ProductFormulaContract(
+            kind="suzuki_trotter",
+            operands={
+                "hamiltonian_operand": 1,
+                "order_operand": 2,
+                "time_operand": 3,
+                "steps_operand": 4,
+            },
+        ),
+        source="_trotter_evolve",
+        operand_count=5,
+    )
+)
 
 
 # ======================================================================
@@ -188,18 +211,25 @@ def trotterized_time_evolution(
     Raises:
         ValueError: If ``hamiltonian`` has fewer than two terms, if
             ``order`` is a ``bool``, or if ``order`` is not ``1`` or a
-            positive even integer.  When these arguments are still
-            symbolic (e.g. the enclosing kernel has not been re-traced
-            with bindings yet) validation silently defers.
+            positive even integer, or if ``step`` is not a positive integer.
+            When these arguments are still symbolic (e.g. the enclosing
+            kernel has not been re-traced with bindings yet) validation
+            silently defers.
     """
     # ``bool`` is a subclass of ``int``; reject it before numeric checks
     # so ``order=True`` does not silently satisfy ``order == 1``.
     if isinstance(order, bool):
         raise ValueError(f"order must be int or qmc.UInt, got bool ({order})")
+    if isinstance(step, bool):
+        raise ValueError(f"step must be int or qmc.UInt, got bool ({step})")
 
     o = _resolve_order(order)
     if o is not None and not (o == 1 or (o >= 2 and o % 2 == 0)):
         raise ValueError(f"order must be 1 or a positive even integer, got {o}")
+
+    resolved_step = _resolve_order(step)
+    if resolved_step is not None and resolved_step <= 0:
+        raise ValueError(f"step must be a positive integer, got {resolved_step}")
 
     n = _resolve_hamiltonian_len(hamiltonian)
     if n is not None and n < 2:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import cast
 
 from qamomile.circuit.ir.block import Block, BlockKind
+from qamomile.circuit.ir.dataflow import walk_operations
 from qamomile.circuit.ir.operation import Operation
 from qamomile.circuit.ir.operation.callable import (
     CallPolicy,
@@ -17,6 +18,7 @@ from qamomile.circuit.ir.operation.control_flow import HasNestedOps
 from qamomile.circuit.ir.operation.gate import ControlledUOperation
 from qamomile.circuit.ir.operation.inverse_block import InverseBlockOperation
 from qamomile.circuit.ir.operation.return_operation import ReturnOperation
+from qamomile.circuit.ir.operation.select import SelectOperation
 from qamomile.circuit.ir.value import (
     ArrayValue,
     DictValue,
@@ -41,11 +43,17 @@ def find_return_operation(operations: list[Operation]) -> ReturnOperation | None
     return None
 
 
-def _invoke_inline_body(op: InvokeOperation) -> Block | None:
+def _invoke_inline_body(
+    op: InvokeOperation,
+    body_selector: Callable[[InvokeOperation], Block | None] | None = None,
+) -> Block | None:
     """Return the body of an inlineable InvokeOperation.
 
     Args:
         op (InvokeOperation): Invocation to inspect.
+        body_selector (Callable[[InvokeOperation], Block | None] | None):
+            Optional consumer-specific body selector. Defaults to the
+            invocation's ordinary effective body.
 
     Returns:
         Block | None: Body to inline, or ``None`` when the invocation should
@@ -55,7 +63,7 @@ def _invoke_inline_body(op: InvokeOperation) -> Block | None:
         return None
     if op.default_policy is not CallPolicy.INLINE:
         return None
-    body = op.effective_body()
+    body = body_selector(op) if body_selector is not None else op.effective_body()
     if isinstance(body, Block):
         return body
     return None
@@ -163,6 +171,61 @@ def _map_value_structure(
             )
 
 
+def _bound_array_entry_groups(
+    block: Block,
+    bound_arrays: Sequence[tuple[ArrayValue, ArrayValue]],
+    remapper: UUIDRemapper,
+) -> tuple[tuple[ArrayValue, tuple[ArrayValue, ...]], ...]:
+    """Map caller arrays to cloned callee entry values needing snapshots.
+
+    A traced loop can use an internal pre-iteration SSA value that belongs to
+    a formal array's logical lineage but has a different UUID from the formal
+    itself. Ordinary value substitution therefore cannot connect that entry
+    to the caller's current persistent array state. Only unproduced operands
+    are entry values; produced values are later SSA versions and must retain
+    their independent identities.
+
+    Args:
+        block (Block): Original callee body before UUID cloning.
+        bound_arrays (Sequence[tuple[ArrayValue, ArrayValue]]): Formal arrays
+            paired with their resolved caller operands.
+        remapper (UUIDRemapper): Completed callee clone remapper.
+
+    Returns:
+        tuple[tuple[ArrayValue, tuple[ArrayValue, ...]], ...]: Caller arrays
+        paired with cloned callee entry values in deterministic body order.
+    """
+    operations = tuple(walk_operations(block.operations))
+    produced = {
+        result.uuid
+        for operation in operations
+        for result in operation.results
+        if isinstance(result, ArrayValue)
+    }
+    groups: list[tuple[ArrayValue, tuple[ArrayValue, ...]]] = []
+    for formal, actual in bound_arrays:
+        entries: list[ArrayValue] = []
+        seen: set[str] = set()
+        for operation in operations:
+            for operand in operation.operands:
+                if (
+                    not isinstance(operand, ArrayValue)
+                    or operand.type.is_quantum()
+                    or operand.logical_id != formal.logical_id
+                    or operand.uuid == formal.uuid
+                    or operand.uuid in produced
+                ):
+                    continue
+                cloned = cast(ArrayValue, remapper.clone_value(operand))
+                if cloned.uuid in seen:
+                    continue
+                seen.add(cloned.uuid)
+                entries.append(cloned)
+        if entries:
+            groups.append((actual, tuple(entries)))
+    return tuple(groups)
+
+
 def _substitute_output_values(
     output_values: list[ValueLike],
     value_map: dict[str, ValueBase],
@@ -183,48 +246,183 @@ def _substitute_output_values(
     ]
 
 
-def _has_any_inline_call(operations: list[Operation]) -> bool:
-    """Return whether any operation (or nested operation) is a call.
+def _operation_tree_values(operations: Sequence[Operation]) -> Iterator[ValueBase]:
+    """Yield every directly stored value in a structured operation tree.
 
-    Recurses into the nested blocks of ``InverseBlockOperation`` and
-    ``ControlledUOperation`` and into ``HasNestedOps``
-    bodies, so a call hidden inside a control-flow body or an
-    operation-owned block is still detected. ``InlinePass`` uses this to
-    decide whether its output block is ``AFFINE`` (no calls remain) or
-    stays ``HIERARCHICAL``.
+    Args:
+        operations (Sequence[Operation]): Operations and nested regions to
+            traverse.
+
+    Yields:
+        ValueBase: Input, result, or explicit region-boundary value.
+    """
+    for operation in operations:
+        yield from operation.all_input_values()
+        yield from operation.results
+        if isinstance(operation, HasNestedOps):
+            for region in operation.nested_regions():
+                yield from region.block_args
+                yield from region.captures
+                yield from region.yields
+                yield from _operation_tree_values(region.operations)
+
+
+def _replace_operation_tree_values(
+    operations: Sequence[Operation],
+    replacements: Mapping[str, ValueBase],
+) -> list[Operation]:
+    """Replace UUID-matched values throughout structured operation regions.
+
+    Args:
+        operations (Sequence[Operation]): Operations to rewrite recursively.
+        replacements (Mapping[str, ValueBase]): UUID-keyed replacement values.
+
+    Returns:
+        list[Operation]: Operations with direct and region-boundary references
+            rewritten consistently.
+
+    Raises:
+        ValueError: If a control-flow operation rejects its rebuilt region
+            interface.
+    """
+    replacement_map = dict(replacements)
+    rewritten: list[Operation] = []
+    for operation in operations:
+        if isinstance(operation, HasNestedOps):
+            regions = tuple(
+                dataclasses.replace(
+                    region,
+                    operations=tuple(
+                        _replace_operation_tree_values(
+                            region.operations,
+                            replacements,
+                        )
+                    ),
+                    block_args=tuple(
+                        replacements.get(value.uuid, value)
+                        for value in region.block_args
+                    ),
+                    captures=tuple(
+                        replacements.get(value.uuid, value) for value in region.captures
+                    ),
+                    yields=tuple(
+                        replacements.get(value.uuid, value) for value in region.yields
+                    ),
+                )
+                for region in operation.nested_regions()
+            )
+            operation = operation.rebuild_regions(regions)
+        rewritten.append(operation.replace_values(replacement_map))
+    return rewritten
+
+
+def _restore_bound_quantum_element_addresses(
+    operations: Sequence[Operation],
+    addresses: Mapping[str, tuple[ArrayValue, tuple[Value, ...]]],
+) -> list[Operation]:
+    """Restore caller array-element addresses on cloned callee SSA values.
+
+    A scalar qkernel formal does not itself retain the ``parent_array`` and
+    index metadata of the caller element bound to it. Resource liveness needs
+    that address on every cloned SSA version to prove that different symbolic
+    loop iterations touch distinct array lanes.
+
+    Args:
+        operations (Sequence[Operation]): Inlined operations to normalize.
+        addresses (Mapping[str, tuple[ArrayValue, tuple[Value, ...]]]): Caller
+            parent arrays and indices keyed by the preserved logical owner.
+
+    Returns:
+        list[Operation]: Operations whose matching scalar quantum values carry
+            their caller element addresses.
+
+    Raises:
+        ValueError: If rebuilding a structured operation rejects its region
+            interface.
+    """
+    replacements: dict[str, ValueBase] = {}
+    for value in _operation_tree_values(operations):
+        if (
+            isinstance(value, Value)
+            and not isinstance(value, ArrayValue)
+            and value.type.is_quantum()
+            and value.logical_id in addresses
+        ):
+            parent_array, element_indices = addresses[value.logical_id]
+            replacements[value.uuid] = dataclasses.replace(
+                value,
+                parent_array=parent_array,
+                element_indices=element_indices,
+            )
+    if not replacements:
+        return list(operations)
+    return _replace_operation_tree_values(operations, replacements)
+
+
+def _iter_inline_invokes(
+    operations: list[Operation],
+    body_selector: Callable[[InvokeOperation], Block | None] | None = None,
+) -> Iterator[InvokeOperation]:
+    """Yield every inlineable invocation reachable from an operation list.
+
+    Recurses into the nested blocks of ``InverseBlockOperation``,
+    ``ControlledUOperation``, and ``SelectOperation`` and into
+    ``HasNestedOps`` bodies so detection and counting share one traversal.
 
     Args:
         operations (list[Operation]): Operations to scan.
+        body_selector (Callable[[InvokeOperation], Block | None] | None):
+            Optional consumer-specific body selector. Defaults to None.
 
-    Returns:
-        bool: ``True`` if at least one inlineable call is reachable
-            from *operations*, otherwise ``False``.
+    Yields:
+        InvokeOperation: Each reachable invocation with an inline body.
     """
     for op in operations:
-        if isinstance(op, InvokeOperation) and _invoke_inline_body(op) is not None:
-            return True
+        if (
+            isinstance(op, InvokeOperation)
+            and _invoke_inline_body(op, body_selector) is not None
+        ):
+            yield op
         if isinstance(op, InverseBlockOperation):
             for block in (op.source_block, op.implementation_block):
-                if block is not None and _has_any_inline_call(block.operations):
-                    return True
+                if block is not None:
+                    yield from _iter_inline_invokes(block.operations, body_selector)
         if isinstance(op, ControlledUOperation):
-            if op.block is not None and _has_any_inline_call(op.block.operations):
-                return True
+            if op.block is not None:
+                yield from _iter_inline_invokes(op.block.operations, body_selector)
+        if isinstance(op, SelectOperation):
+            for block in op.case_blocks:
+                yield from _iter_inline_invokes(block.operations, body_selector)
         if isinstance(op, HasNestedOps):
             for body in op.nested_op_lists():
-                if _has_any_inline_call(body):
-                    return True
-    return False
+                yield from _iter_inline_invokes(body, body_selector)
+
+
+def _has_any_inline_call(
+    operations: list[Operation],
+    body_selector: Callable[[InvokeOperation], Block | None] | None = None,
+) -> bool:
+    """Return whether any inlineable call is reachable from operations.
+
+    Args:
+        operations (list[Operation]): Operations to scan.
+        body_selector (Callable[[InvokeOperation], Block | None] | None):
+            Optional consumer-specific body selector. Defaults to None.
+
+    Returns:
+        bool: Whether at least one inlineable invocation is reachable.
+    """
+    return next(_iter_inline_invokes(operations, body_selector), None) is not None
 
 
 def count_inline_invokes(operations: list[Operation]) -> int:
     """Count all inlineable calls reachable from an operation list.
 
-    Recurses into ``InverseBlockOperation`` / ``ControlledUOperation``
-    nested blocks and into ``HasNestedOps`` bodies, so calls hidden inside
-    control flow or operation-owned blocks are
-    counted. ``unroll_recursion`` uses this as the primary termination
-    signal (``count == 0`` means the block is fully inlined).
+    Recurses into ``InverseBlockOperation`` / ``ControlledUOperation`` /
+    ``SelectOperation`` nested blocks and into ``HasNestedOps`` bodies, so
+    calls hidden inside control flow or operation-owned blocks are counted.
+    ``unroll_recursion`` uses this as the primary termination signal
+    (``count == 0`` means the block is fully inlined).
 
     Args:
         operations (list[Operation]): Operations to scan.
@@ -232,37 +430,22 @@ def count_inline_invokes(operations: list[Operation]) -> int:
     Returns:
         int: Total number of inlineable calls reachable from *operations*.
     """
-    count = 0
-    for op in operations:
-        if isinstance(op, InvokeOperation) and _invoke_inline_body(op) is not None:
-            count += 1
-        if isinstance(op, InverseBlockOperation):
-            for block in (op.source_block, op.implementation_block):
-                if block is not None:
-                    count += count_inline_invokes(block.operations)
-        if isinstance(op, ControlledUOperation):
-            if op.block is not None:
-                count += count_inline_invokes(op.block.operations)
-        if isinstance(op, HasNestedOps):
-            for body in op.nested_op_lists():
-                count += count_inline_invokes(body)
-    return count
+    return sum(1 for _ in _iter_inline_invokes(operations))
 
 
 def count_unrollable_inline_invokes(operations: list[Operation]) -> int:
     """Count inlineable calls the inline/partial-eval loop can still resolve.
 
     This mirrors :func:`count_inline_invokes` but **does not** descend into
-    a ``ControlledUOperation.block`` or an ``InverseBlockOperation``'s
-    nested blocks. A call still inside one of those operation-owned blocks
-    after a full ``inline`` pass is a self-recursive call that inline's
-    cycle guard could not unroll — it stops after one layer and does not
-    re-enter the operation-owned block — so no later ``unroll_recursion``
-    iteration can resolve it. Folding compile-time ``if``s there (which
-    ``CompileTimeIfLoweringPass`` does do for a ``ControlledUOperation``'s
-    block) never removes the trapped call itself. Such a call is therefore
-    *not* unrollable. Calls at the top level or inside ``For`` / ``If`` /
-    ``While`` bodies are unrollable and are counted.
+    a ``ControlledUOperation.block``, an ``InverseBlockOperation``'s nested
+    blocks, or a ``SelectOperation`` case block. A call still inside one of
+    those operation-owned blocks after a full ``inline`` pass is a
+    self-recursive call that inline's cycle guard could not unroll — it stops
+    after one layer and does not re-enter the operation-owned block — so no
+    later ``unroll_recursion`` iteration can resolve it. Folding compile-time
+    ``if``s there never removes the trapped call itself. Such a call is
+    therefore *not* unrollable. Calls at the top level or inside ``For`` /
+    ``If`` / ``While`` bodies are unrollable and are counted.
 
     The unroll loop uses this to tell two failure modes apart: a non-zero
     :func:`count_inline_invokes` with a zero ``count_unrollable_inline_invokes``
@@ -276,8 +459,8 @@ def count_unrollable_inline_invokes(operations: list[Operation]) -> int:
 
     Returns:
         int: Number of inlineable calls reachable without entering a
-            ``ControlledUOperation.block`` or ``InverseBlockOperation``
-            nested block.
+            ``ControlledUOperation.block``, ``InverseBlockOperation`` nested
+            block, or ``SelectOperation`` case block.
     """
     count = 0
     for op in operations:
@@ -297,7 +480,70 @@ class InlinePass(Pass[Block, Block]):
 
     Input: Block with BlockKind.HIERARCHICAL (may contain callable calls)
     Output: Block with BlockKind.AFFINE (no inline callable calls)
+
+    Args:
+        body_selector (Callable[[InvokeOperation], Block | None] | None):
+            Optional body-selection hook for consumers whose configured
+            strategy differs from ``InvokeOperation.strategy_name``. The
+            standard compiler leaves this unset. Defaults to None.
+        inline_prefix_factory (Callable[[InvokeOperation,
+            tuple[tuple[ArrayValue, tuple[ArrayValue, ...]], ...]],
+            Sequence[Operation]] | None): Optional hook that emits caller-scoped
+            operations immediately before an invocation boundary is dissolved.
+            The hook receives the caller-substituted invocation and any cloned
+            classical-array entry values that require call-time state. Defaults
+            to ``None``.
+        preserve_bound_quantum_identity (bool): Whether cloned callee quantum
+            values should retain the logical owner and array-element address
+            of their bound caller operands. Resource liveness analysis enables
+            this so an inline call does not create phantom owners or erase
+            lane identities. Defaults to ``False``.
+        preserve_bound_array_identity (bool): Whether cloned callee array
+            values should retain the logical lineage of bound caller arrays.
+            Resource classical-state analysis enables this so loop-carried
+            stores remain connected across an inlined call. Defaults to
+            ``False``.
     """
+
+    def __init__(
+        self,
+        body_selector: Callable[[InvokeOperation], Block | None] | None = None,
+        *,
+        inline_prefix_factory: Callable[
+            [
+                InvokeOperation,
+                tuple[tuple[ArrayValue, tuple[ArrayValue, ...]], ...],
+            ],
+            Sequence[Operation],
+        ]
+        | None = None,
+        preserve_bound_quantum_identity: bool = False,
+        preserve_bound_array_identity: bool = False,
+    ) -> None:
+        """Initialize the pass with body-selection and identity policies.
+
+        Args:
+            body_selector (Callable[[InvokeOperation], Block | None] | None):
+                Consumer-specific selector used for inline-policy calls.
+                Defaults to the invocation's ordinary effective body.
+            inline_prefix_factory (Callable[[InvokeOperation,
+                tuple[tuple[ArrayValue, tuple[ArrayValue, ...]], ...]],
+                Sequence[Operation]] | None): Optional factory for operations
+                that must remain at the original call site after inlining. The
+                factory receives a caller-substituted invocation and cloned
+                classical-array entry groups. Defaults to ``None``.
+            preserve_bound_quantum_identity (bool): Whether cloned quantum SSA
+                values descending from a formal input retain the actual caller
+                operand's logical owner and array-element address. Defaults to
+                ``False``.
+            preserve_bound_array_identity (bool): Whether cloned array SSA
+                values descending from a formal input retain the actual caller
+                array's logical lineage. Defaults to ``False``.
+        """
+        self._body_selector = body_selector
+        self._inline_prefix_factory = inline_prefix_factory
+        self._preserve_bound_quantum_identity = preserve_bound_quantum_identity
+        self._preserve_bound_array_identity = preserve_bound_array_identity
 
     @property
     def name(self) -> str:
@@ -330,7 +576,7 @@ class InlinePass(Pass[Block, Block]):
 
         out_kind = (
             BlockKind.HIERARCHICAL
-            if _has_any_inline_call(serialized_ops)
+            if _has_any_inline_call(serialized_ops, self._body_selector)
             else BlockKind.AFFINE
         )
 
@@ -352,7 +598,23 @@ class InlinePass(Pass[Block, Block]):
         value_map: dict[str, ValueBase],
         visiting_blocks: set[int],
     ) -> list[Operation]:
-        """Recursively serialize a list of operations."""
+        """Recursively inline calls in one same-scope operation list.
+
+        Operation-owned blocks are delegated to :meth:`_inline_nested_block`
+        so each keeps its independent formal-value namespace. Only the owning
+        operation's operands and results are substituted through ``value_map``.
+
+        Args:
+            operations (list[Operation]): Operations to rewrite in order.
+            value_map (dict[str, ValueBase]): Caller-scope substitutions
+                accumulated by prior inline calls.
+            visiting_blocks (set[int]): Block identities on the active
+                expansion path, used to stop recursive inlining.
+
+        Returns:
+            list[Operation]: Rewritten operations with reachable inline-policy
+                calls expanded as far as the recursion guard permits.
+        """
         result: list[Operation] = []
 
         for op in operations:
@@ -363,7 +625,7 @@ class InlinePass(Pass[Block, Block]):
 
             elif (
                 isinstance(op, InvokeOperation)
-                and (body := _invoke_inline_body(op)) is not None
+                and (body := _invoke_inline_body(op, self._body_selector)) is not None
             ):
                 if id(body) in visiting_blocks:
                     substituted = self._substitute_values(op, value_map)
@@ -372,14 +634,33 @@ class InlinePass(Pass[Block, Block]):
                     inlined = self._inline_invoke(op, body, value_map, visiting_blocks)
                     result.extend(inlined)
 
-            elif isinstance(op, HasNestedOps):
-                # Generic recursion for For/ForItems/While: recurse into
-                # nested bodies, rebuild, then substitute values.
-                new_lists = [
-                    self._serialize_operations(body, value_map, visiting_blocks)
-                    for body in op.nested_op_lists()
+            elif isinstance(op, SelectOperation):
+                case_blocks = [
+                    cast(
+                        Block,
+                        self._inline_nested_block(case_block, visiting_blocks),
+                    )
+                    for case_block in op.case_blocks
                 ]
-                new_op = op.rebuild_nested(new_lists)
+                new_op = dataclasses.replace(op, case_blocks=case_blocks)
+                substituted = self._substitute_values(new_op, value_map)
+                result.append(substituted)
+
+            elif isinstance(op, HasNestedOps):
+                new_regions = tuple(
+                    dataclasses.replace(
+                        region,
+                        operations=tuple(
+                            self._serialize_operations(
+                                list(region.operations),
+                                value_map,
+                                visiting_blocks,
+                            )
+                        ),
+                    )
+                    for region in op.nested_regions()
+                )
+                new_op = op.rebuild_regions(new_regions)
                 new_op = self._substitute_values(new_op, value_map)
                 result.append(new_op)
 
@@ -432,6 +713,7 @@ class InlinePass(Pass[Block, Block]):
         block: Block,
         call_operands: Sequence[ValueLike],
         call_results: Sequence[ValueLike],
+        boundary_operation: InvokeOperation,
         value_map: dict[str, ValueBase],
         visiting_blocks: set[int],
     ) -> list[Operation]:
@@ -446,6 +728,8 @@ class InlinePass(Pass[Block, Block]):
                 call site.
             call_results (Sequence[ValueLike]): Result values produced by the call
                 site.
+            boundary_operation (InvokeOperation): Caller-substituted
+                invocation supplied to the optional boundary hook.
             value_map (dict[str, ValueBase]): Caller-scope value substitutions
                 accumulated so far; updated in place with the mappings for
                 this call's results.
@@ -495,6 +779,7 @@ class InlinePass(Pass[Block, Block]):
         # ``uuid`` (not ``logical_id``); wire-level linearity is enforced by
         # the frontend.
         seen_quantum_args: dict[str, str] = {}
+        bound_arrays: list[tuple[ArrayValue, ArrayValue]] = []
         for arg_index, (block_input, call_arg) in enumerate(
             zip(block.input_values, call_args, strict=True)
         ):
@@ -526,7 +811,6 @@ class InlinePass(Pass[Block, Block]):
                 local_map,
                 map_dict_entries=False,
             )
-
             # If both are ArrayValues, also map shape dimensions
             # This ensures symbolic dimensions (e.g., qubits_dim0) are resolved
             # to concrete values from the caller's array. Chase through
@@ -535,6 +819,12 @@ class InlinePass(Pass[Block, Block]):
             if isinstance(resolved_arg, ArrayValue) and isinstance(
                 block_input, ArrayValue
             ):
+                if (
+                    self._preserve_bound_array_identity
+                    and self._inline_prefix_factory is not None
+                    and not block_input.type.is_quantum()
+                ):
+                    bound_arrays.append((block_input, resolved_arg))
                 for block_dim, arg_dim in zip(block_input.shape, resolved_arg.shape):
                     resolved_dim = value_map.get(arg_dim.uuid, arg_dim)
                     # Multi-level chase (guard against cycles).
@@ -559,10 +849,48 @@ class InlinePass(Pass[Block, Block]):
                     # silently drops the measurement entirely.
                     value_map[block_dim.uuid] = resolved_dim
 
-        # Clone operations with fresh UUIDs using UUIDRemapper
+        # Clone operations with fresh UUIDs using UUIDRemapper.
         remapper = UUIDRemapper()
+        bound_element_addresses: dict[
+            str,
+            tuple[ArrayValue, tuple[Value, ...]],
+        ] = {}
+        if self._preserve_bound_quantum_identity or self._preserve_bound_array_identity:
+            for block_input in block.input_values:
+                resolved_input = local_map.get(block_input.uuid)
+                preserves_quantum = (
+                    self._preserve_bound_quantum_identity
+                    and block_input.type.is_quantum()
+                    and isinstance(resolved_input, ValueBase)
+                )
+                preserves_array = (
+                    self._preserve_bound_array_identity
+                    and isinstance(block_input, ArrayValue)
+                    and isinstance(resolved_input, ArrayValue)
+                )
+                if preserves_quantum or preserves_array:
+                    assert isinstance(resolved_input, ValueBase)
+                    remapper.logical_id_remap[block_input.logical_id] = (
+                        resolved_input.logical_id
+                    )
+                    if (
+                        preserves_quantum
+                        and isinstance(resolved_input, Value)
+                        and not isinstance(resolved_input, ArrayValue)
+                        and resolved_input.parent_array is not None
+                        and resolved_input.element_indices
+                    ):
+                        bound_element_addresses[resolved_input.logical_id] = (
+                            resolved_input.parent_array,
+                            resolved_input.element_indices,
+                        )
         cloned_ops = remapper.clone_operations(block.operations)
         uuid_remap = remapper.uuid_remap
+        array_entry_groups = (
+            _bound_array_entry_groups(block, bound_arrays, remapper)
+            if bound_arrays
+            else ()
+        )
 
         # Build remapped_local_map with cloned UUIDs
         remapped_local_map: dict[str, ValueBase] = {}
@@ -584,6 +912,11 @@ class InlinePass(Pass[Block, Block]):
         inlined = self._serialize_operations(
             cloned_ops, remapped_local_map, inner_visiting
         )
+        if bound_element_addresses:
+            inlined = _restore_bound_quantum_element_addresses(
+                inlined,
+                bound_element_addresses,
+            )
 
         # Get return values from ReturnOperation (source of truth)
         return_op = find_return_operation(cloned_ops)
@@ -635,7 +968,12 @@ class InlinePass(Pass[Block, Block]):
                     if cr_dim.uuid != resolved_dim.uuid:
                         value_map[cr_dim.uuid] = resolved_dim
 
-        return inlined
+        prefix = (
+            tuple(self._inline_prefix_factory(boundary_operation, array_entry_groups))
+            if self._inline_prefix_factory is not None
+            else ()
+        )
+        return [*prefix, *inlined]
 
     def _inline_nested_block(
         self,
@@ -666,7 +1004,7 @@ class InlinePass(Pass[Block, Block]):
         output_values = _substitute_output_values(block.output_values, value_map)
         out_kind = (
             BlockKind.HIERARCHICAL
-            if _has_any_inline_call(serialized_ops)
+            if _has_any_inline_call(serialized_ops, self._body_selector)
             else BlockKind.AFFINE
         )
         return dataclasses.replace(
@@ -694,10 +1032,15 @@ class InlinePass(Pass[Block, Block]):
         Returns:
             list[Operation]: Inlined operations.
         """
+        boundary_operation = cast(
+            InvokeOperation,
+            self._substitute_values(op, value_map),
+        )
         return self._inline_block_call(
             block=body,
             call_operands=op.operands,
             call_results=op.results,
+            boundary_operation=boundary_operation,
             value_map=value_map,
             visiting_blocks=visiting_blocks,
         )

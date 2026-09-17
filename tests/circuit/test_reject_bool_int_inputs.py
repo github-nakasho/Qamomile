@@ -6,6 +6,7 @@ silently treat them as ``1`` / ``0``. These tests pin that the frontend
 integer inputs reject a bool via ``is_plain_int`` (or an equivalent explicit
 guard) instead of silently coercing it:
 
+- compile-time ``UInt`` / ``int`` qkernel bindings,
 - ``uint(...)`` constructor,
 - array element indexing / slice bounds (``qs[True]``, ``qs[True:3]``),
 - ``control(..., num_controls=...)``.
@@ -16,6 +17,7 @@ This mirrors the serialization-side guards in ``tests/circuit/ir/test_serialize.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 import qamomile.circuit as qmc
@@ -26,6 +28,44 @@ from qamomile.circuit.frontend.constructors import uint
 def _phase(q: qmc.Qubit, theta: qmc.Float) -> qmc.Qubit:
     """Single-qubit phase rotation used as a controlled-U body."""
     return qmc.p(q, theta)
+
+
+@qmc.qkernel
+def _bound_uint_entry(n: qmc.UInt) -> qmc.Bit:
+    """Expose a UInt argument through the ordinary QKernel build path."""
+    _ = n
+    return qmc.measure(qmc.qubit("q"))
+
+
+class TestUIntBindingRequiresIntegralScalar:
+    """Compile-time UInt bindings reject coercive float and bool inputs."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(3.0, id="python-float"),
+            pytest.param(np.float64(3.0), id="numpy-float"),
+            pytest.param(True, id="python-bool"),
+            pytest.param(np.bool_(True), id="numpy-bool"),
+        ],
+    )
+    def test_qkernel_build_rejects_non_integral_uint_binding(self, value):
+        """QKernel.build never truncates or boolean-coerces a UInt binding."""
+        with pytest.raises(TypeError, match=r"UInt binding 'n'.*integer"):
+            _bound_uint_entry.build(n=value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(3, id="python-int"),
+            pytest.param(np.int64(3), id="numpy-int"),
+        ],
+    )
+    def test_qkernel_build_accepts_integral_uint_binding(self, value):
+        """Python and NumPy integer scalars remain valid UInt bindings."""
+        block = _bound_uint_entry.build(n=value)
+        assert block.param_slots[0].name == "n"
+        assert int(block.param_slots[0].bound_value) == 3
 
 
 class TestUintRejectsBool:
@@ -61,6 +101,32 @@ class TestControlNumControlsRejectsBool:
         """A valid integer control count still constructs."""
         assert qmc.control(_phase, num_controls=2)._num_controls == 2
         assert qmc.control(_phase)._num_controls == 1
+
+    @pytest.mark.parametrize(
+        "value",
+        [pytest.param(2.0, id="python"), pytest.param(np.float64(2.0), id="numpy")],
+    )
+    def test_num_controls_rejects_integer_valued_real(self, value: object) -> None:
+        """Control widths remain integral-type-only, unlike gate powers."""
+        with pytest.raises(TypeError, match="positive integer or UInt"):
+            qmc.control(_phase, num_controls=value)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("target", [_phase, qmc.x])
+    def test_num_controls_normalizes_numpy_integer(self, target):
+        """Qkernels and built-in gates normalize NumPy integral widths."""
+        controlled = qmc.control(target, num_controls=np.int64(2))
+
+        assert controlled._num_controls == 2
+        assert isinstance(controlled._num_controls, int)
+
+    def test_nested_control_normalizes_numpy_integer(self):
+        """A NumPy width composes with an existing controlled wrapper."""
+        controlled = qmc.control(_phase)
+
+        nested = qmc.control(controlled, num_controls=np.int64(2))
+
+        assert nested._num_controls == 3
+        assert isinstance(nested._num_controls, int)
 
 
 class TestArrayIndexRejectsBool:

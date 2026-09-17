@@ -10,11 +10,22 @@ import matplotlib.patches as mpatches
 import pytest
 
 import qamomile.circuit as qmc
+from qamomile.circuit.ir.block import Block
+from qamomile.circuit.ir.operation.callable import (
+    CallableDef,
+    CallableImplementation,
+    CallableRef,
+    CallTransform,
+    InvokeOperation,
+)
 from qamomile.circuit.ir.operation.gate import GateOperationType
+from qamomile.circuit.ir.operation.inverse_block import InverseBlockOperation
+from qamomile.circuit.ir.types.primitives import QubitType
+from qamomile.circuit.ir.value import Value
 from qamomile.circuit.visualization.analyzer import CircuitAnalyzer
 from qamomile.circuit.visualization.drawer import MatplotlibDrawer
 from qamomile.circuit.visualization.style import DEFAULT_STYLE
-from qamomile.circuit.visualization.visual_ir import VGate, VGateKind
+from qamomile.circuit.visualization.visual_ir import VGate, VGateKind, VInlineBlock
 
 
 @qmc.qkernel
@@ -166,6 +177,121 @@ def _powered_controlled_swap_kernel() -> tuple[qmc.Qubit, qmc.Qubit, qmc.Qubit]:
     return cswap(q[0], q[1], q[2], power=2)
 
 
+@qmc.composite_gate(name="drawer_patterned_x")
+def _drawer_patterned_x(q: qmc.Qubit) -> qmc.Qubit:
+    """Apply X inside a preserved visual callable."""
+    return qmc.x(q)
+
+
+@qmc.qkernel
+def _drawer_inverse_phase_body(q: qmc.Qubit) -> qmc.Qubit:
+    """Implement S-dagger as Z followed by S."""
+    q = qmc.z(q)
+    return qmc.s(q)
+
+
+@qmc.composite_gate(
+    name="drawer_inverse_implemented_phase",
+    implementations=[
+        CallableImplementation(
+            transform=CallTransform.INVERSE,
+            body=_drawer_inverse_phase_body.block,
+        )
+    ],
+)
+def _drawer_inverse_implemented_phase(q: qmc.Qubit) -> qmc.Qubit:
+    """Apply the forward S body of an inverse-aware composite."""
+    return qmc.s(q)
+
+
+@qmc.qkernel
+def _drawer_controlled_inverse_implemented_kernel() -> tuple[
+    qmc.Qubit,
+    qmc.Qubit,
+]:
+    """Apply an explicitly implemented inverse under one control."""
+    control = qmc.qubit("control")
+    target = qmc.qubit("target")
+    return qmc.control(qmc.inverse(_drawer_inverse_implemented_phase))(
+        control,
+        target,
+    )
+
+
+@qmc.qkernel
+def _patterned_controlled_x_kernel() -> tuple[
+    qmc.Qubit,
+    qmc.Qubit,
+    qmc.Qubit,
+]:
+    """Apply X when the two controls hold LSB-first value two."""
+    q = qmc.qubit_array(3, "q")
+    return qmc.control(qmc.x, num_controls=2, control_value=2)(q[0], q[1], q[2])
+
+
+@qmc.qkernel
+def _patterned_controlled_composite_layer(
+    c0: qmc.Qubit,
+    c1: qmc.Qubit,
+    target: qmc.Qubit,
+) -> tuple[qmc.Qubit, qmc.Qubit, qmc.Qubit]:
+    """Apply a boxed X when the controls hold value two."""
+    return qmc.control(
+        _drawer_patterned_x,
+        num_controls=2,
+        control_value=2,
+    )(c0, c1, target)
+
+
+@qmc.qkernel
+def _patterned_controlled_composite_kernel() -> tuple[
+    qmc.Qubit,
+    qmc.Qubit,
+    qmc.Qubit,
+]:
+    """Apply the patterned boxed X directly on three allocated wires."""
+    q = qmc.qubit_array(3, "q")
+    return qmc.control(
+        _drawer_patterned_x,
+        num_controls=2,
+        control_value=2,
+    )(q[0], q[1], q[2])
+
+
+@qmc.qkernel
+def _patterned_inverse_kernel() -> tuple[qmc.Qubit, qmc.Qubit, qmc.Qubit]:
+    """Invert the patterned boxed-control layer."""
+    q = qmc.qubit_array(3, "q")
+    return qmc.inverse(_patterned_controlled_composite_layer)(q[0], q[1], q[2])
+
+
+_CONTROLLED_INVERSE_ORACLE = qmc.opaque(
+    "drawer_controlled_inverse",
+    num_qubits=1,
+)
+
+
+@qmc.qkernel
+def _controlled_inverse_oracle_kernel() -> tuple[
+    qmc.Qubit,
+    qmc.Qubit,
+    qmc.Qubit,
+]:
+    """Apply a bodyless controlled-inverse call with a mixed control pattern."""
+    transformed = qmc.inverse(
+        qmc.control(
+            _CONTROLLED_INVERSE_ORACLE,
+            num_controls=2,
+            control_value=2,
+        )
+    )
+    return transformed(
+        qmc.qubit("control_0"),
+        qmc.qubit("control_1"),
+        qmc.qubit("target"),
+    )
+
+
 def _controlled_u_nodes(kernel: Any) -> list[VGate]:
     """Build controlled-U visual nodes from a kernel.
 
@@ -245,6 +371,235 @@ def test_controlled_swap_draws_symbols_instead_of_target_box():
 
     assert rounded_boxes == []
     assert len(control_dots) == 1
+
+
+def test_patterned_control_visual_ir_is_lsb_aligned_for_concrete_and_invoke():
+    """Concrete and boxed controls retain the open/filled pattern ``(0, 1)``."""
+    concrete = _controlled_u_nodes(_patterned_controlled_x_kernel)
+    invoke = _controlled_u_nodes(_patterned_controlled_composite_kernel)
+
+    assert len(concrete) == 1
+    assert concrete[0].control_count == 2
+    assert concrete[0].control_pattern == (0, 1)
+    assert len(invoke) == 1
+    assert invoke[0].control_count == 2
+    assert invoke[0].control_pattern == (0, 1)
+
+
+def test_patterned_inverse_visual_ir_retains_control_pattern():
+    """A controlled InverseBlock renders as a controlled box with its pattern."""
+    entry = _patterned_inverse_kernel._build_graph_for_visualization()
+    [outer_inverse] = [
+        op for op in entry.operations if isinstance(op, InverseBlockOperation)
+    ]
+    assert outer_inverse.implementation_block is not None
+    block = outer_inverse.implementation_block
+    analyzer = CircuitAnalyzer(block, DEFAULT_STYLE)
+    qubit_map = {
+        value.logical_id: index for index, value in enumerate(block.input_values)
+    }
+    qubit_names = {index: value.name for index, value in enumerate(block.input_values)}
+    num_qubits = len(block.input_values)
+    visual = analyzer.build_visual_ir(
+        block,
+        qubit_map,
+        qubit_names,
+        num_qubits,
+    )
+    controlled = [
+        node
+        for node in visual.children
+        if isinstance(node, VGate) and node.kind is VGateKind.CONTROLLED_U_BOX
+    ]
+
+    assert len(controlled) == 1
+    assert controlled[0].control_count == 2
+    assert controlled[0].control_pattern == (0, 1)
+
+
+def test_controlled_inverse_invoke_draws_controlled_pattern() -> None:
+    """CONTROLLED_INVERSE invokes use controlled wires and dagger labeling."""
+    [operation] = [
+        candidate
+        for candidate in _controlled_inverse_oracle_kernel.block.operations
+        if isinstance(candidate, InvokeOperation)
+    ]
+    nodes = _controlled_u_nodes(_controlled_inverse_oracle_kernel)
+
+    assert operation.transform is CallTransform.CONTROLLED_INVERSE
+    assert len(nodes) == 1
+    assert nodes[0].label == "DRAWER_CONTROLLED_INVERSE†"
+    assert nodes[0].qubit_indices == [0, 1, 2]
+    assert nodes[0].control_count == 2
+    assert nodes[0].control_pattern == (0, 1)
+
+    figure = MatplotlibDrawer.draw_kernel(_controlled_inverse_oracle_kernel)
+    controls = [
+        patch
+        for patch in figure.axes[0].patches
+        if isinstance(patch, mpatches.Circle) and patch.radius == 0.1
+    ]
+    assert len(controls) == 2
+
+
+@pytest.mark.parametrize("operation_kind", ["invoke", "inverse"])
+def test_patterned_control_falls_back_when_a_control_wire_is_unresolved(
+    operation_kind,
+):
+    """Partially resolved controls draw filled dots without width errors."""
+    control_0 = Value(type=QubitType(), name="control_0")
+    control_1 = Value(type=QubitType(), name="control_1")
+    target = Value(type=QubitType(), name="target")
+    operands = [control_0, control_1, target]
+    results = [operand.next_version() for operand in operands]
+
+    if operation_kind == "invoke":
+        operation = InvokeOperation(
+            operands=operands,
+            results=results,
+            transform=CallTransform.CONTROLLED,
+            attrs={
+                "num_control_qubits": 2,
+                "num_target_qubits": 1,
+                "control_value": 2,
+            },
+        )
+    else:
+        operation = InverseBlockOperation(
+            operands=operands,
+            results=results,
+            num_control_qubits=2,
+            num_target_qubits=1,
+            custom_name="patterned_inverse",
+            control_value=2,
+        )
+
+    analyzer = CircuitAnalyzer(Block(), DEFAULT_STYLE)
+    node = analyzer._build_vgate(
+        operation,
+        node_key=("partial-control", operation_kind),
+        qubit_map={control_0.logical_id: 0, target.logical_id: 1},
+        logical_id_remap={},
+        param_values={},
+    )
+
+    assert node.control_count == 1
+    assert node.qubit_indices == [0, 1]
+    assert node.control_pattern == (1,)
+
+
+def test_patterned_control_renderer_uses_open_then_filled_circle():
+    """Value two draws the first control open and the second filled."""
+    fig = MatplotlibDrawer.draw_kernel(_patterned_controlled_x_kernel)
+    ax = fig.axes[0]
+    controls = [
+        patch
+        for patch in ax.patches
+        if isinstance(patch, mpatches.Circle) and patch.radius == 0.1
+    ]
+
+    assert len(controls) == 2
+    assert controls[0].get_facecolor() == matplotlib.colors.to_rgba(
+        DEFAULT_STYLE.background_color
+    )
+    assert controls[1].get_facecolor() == matplotlib.colors.to_rgba(
+        DEFAULT_STYLE.wire_color
+    )
+
+
+@pytest.mark.parametrize(
+    ("kernel", "options"),
+    [
+        (_patterned_controlled_x_kernel, {"inline": True}),
+        (_patterned_controlled_composite_kernel, {"expand_composite": True}),
+    ],
+)
+def test_patterned_control_inline_blocks_keep_control_pattern(kernel, options):
+    """Expanded concrete and boxed bodies keep aligned control metadata."""
+    graph = kernel._build_graph_for_visualization()
+    analyzer = CircuitAnalyzer(graph, DEFAULT_STYLE, **options)
+    qubit_map, qubit_names, num_qubits = analyzer.build_qubit_map(graph)
+    visual = analyzer.build_visual_ir(graph, qubit_map, qubit_names, num_qubits)
+    blocks = [node for node in visual.children if isinstance(node, VInlineBlock)]
+
+    assert len(blocks) == 1
+    assert blocks[0].control_qubit_indices == [0, 1]
+    assert blocks[0].control_pattern == (0, 1)
+
+
+def test_controlled_inverse_expansion_uses_selected_inverse_body() -> None:
+    """Expanded controlled-inverse calls draw their registered inverse body."""
+    graph = (
+        _drawer_controlled_inverse_implemented_kernel._build_graph_for_visualization()
+    )
+    analyzer = CircuitAnalyzer(graph, DEFAULT_STYLE, expand_composite=True)
+    qubit_map, qubit_names, num_qubits = analyzer.build_qubit_map(graph)
+    visual = analyzer.build_visual_ir(graph, qubit_map, qubit_names, num_qubits)
+    [block] = [node for node in visual.children if isinstance(node, VInlineBlock)]
+
+    assert [node.label for node in block.children if isinstance(node, VGate)] == [
+        "$Z$",
+        "$S$",
+    ]
+    assert block.control_qubit_indices == [0]
+
+
+def test_inverse_direct_fallback_stays_boxed_when_expansion_is_requested() -> None:
+    """An inverse call never expands its forward-only fallback body."""
+    formal = Value(type=QubitType(), name="formal")
+    body = Block(input_values=[formal], output_values=[formal])
+    target = Value(type=QubitType(), name="target")
+    result = target.next_version()
+    ref = CallableRef(namespace="test.drawer", name="forward_only")
+    operation = InvokeOperation(
+        operands=[target],
+        results=[result],
+        target=ref,
+        transform=CallTransform.INVERSE,
+        attrs={
+            "kind": "composite",
+            "num_control_qubits": 0,
+            "num_target_qubits": 1,
+            "default_policy": "PRESERVE_BOX",
+        },
+        definition=CallableDef(ref=ref, body=body),
+    )
+    graph = Block(
+        input_values=[target],
+        output_values=[result],
+        operations=[operation],
+    )
+    analyzer = CircuitAnalyzer(graph, DEFAULT_STYLE, expand_composite=True)
+    visual = analyzer.build_visual_ir(
+        graph,
+        {target.logical_id: 0},
+        {0: "target"},
+        1,
+    )
+
+    assert not any(isinstance(node, VInlineBlock) for node in visual.children)
+    assert any(isinstance(node, VGate) for node in visual.children)
+
+
+def test_patterned_inverse_inline_block_draws_open_and_filled_controls():
+    """Expanded InverseBlock controls retain and render the mixed pattern."""
+    fig = MatplotlibDrawer.draw_kernel(
+        _patterned_inverse_kernel,
+        expand_composite=True,
+    )
+    controls = [
+        patch
+        for patch in fig.axes[0].patches
+        if isinstance(patch, mpatches.Circle) and patch.radius == 0.1
+    ]
+
+    assert len(controls) == 2
+    assert controls[0].get_facecolor() == matplotlib.colors.to_rgba(
+        DEFAULT_STYLE.background_color
+    )
+    assert controls[1].get_facecolor() == matplotlib.colors.to_rgba(
+        DEFAULT_STYLE.wire_color
+    )
 
 
 class TestInlineControlledLineLayering:

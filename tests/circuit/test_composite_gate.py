@@ -181,6 +181,11 @@ def test_inverse_accepts_a_composite_qkernel() -> None:
     assert inverse.implementation_for() is not None
 
 
+def test_inverse_of_inverse_composite_returns_original_kernel() -> None:
+    """Applying the inverse transform twice cancels at the frontend boundary."""
+    assert qmc.inverse(qmc.inverse(bell_pair)) is bell_pair
+
+
 def test_composite_resource_estimate_is_derived_from_its_body() -> None:
     """A body-backed composite has no second resource-definition surface."""
 
@@ -232,7 +237,7 @@ def test_symbolic_composite_transforms_remain_estimable() -> None:
 
 
 def test_custom_composite_retains_a_decomposable_named_body() -> None:
-    """A generic backend gate keeps identity and an equivalent fallback body."""
+    """A generic engine gate keeps identity and an equivalent fallback body."""
     pytest.importorskip("qiskit")
     from qamomile.qiskit import QiskitTranspiler
 

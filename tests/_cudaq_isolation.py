@@ -6,7 +6,7 @@ qiskit-aer, and cudaq each bundle their own copy of LLVM's OpenMP runtime
 process is undefined behavior; on macOS arm64 it manifests as a
 segmentation fault inside AerSimulator's worker threads once the
 cudaq/torch libraries are resident. The minimal reproduction is running
-``tests/transpiler/backends/test_cudaq.py`` before
+``tests/transpiler/engines/test_cudaq.py`` before
 ``tests/transpiler/test_pauli_evolve_vector_observable.py``: the former's
 module-level ``pytest.importorskip("cudaq")`` executes during collection
 even when every cudaq test is deselected by the default
@@ -26,8 +26,18 @@ The fix has two halves, enforced by ``tests/test_cudaq_import_isolation.py``:
 
 from __future__ import annotations
 
+import os
 import re
 from functools import lru_cache
+from typing import MutableMapping
+
+NATIVE_THREAD_LIMIT_ENV: tuple[str, ...] = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 
 #: Test modules (rootdir-relative POSIX paths) that import ``cudaq`` at
 #: module scope, i.e. during collection. Every entry must also carry
@@ -35,8 +45,8 @@ from functools import lru_cache
 #: keeps this table in sync with the actual test sources.
 CUDAQ_MODULE_LEVEL_IMPORTERS: frozenset[str] = frozenset(
     {
-        "tests/transpiler/backends/test_cudaq.py",
-        "tests/transpiler/backends/test_cudaq_frontend.py",
+        "tests/transpiler/engines/test_cudaq.py",
+        "tests/transpiler/engines/test_cudaq_frontend.py",
     }
 )
 
@@ -76,3 +86,21 @@ def markexpr_can_select_cudaq(markexpr: str) -> bool:
         # upgrade, recognize only the stock exclusion spelling and
         # otherwise keep collecting as before — never wrongly hide tests.
         return re.search(r"\bnot\s+cudaq\b", expression) is None
+
+
+def configure_cudaq_thread_limits(
+    markexpr: str,
+    environ: MutableMapping[str, str] | None = None,
+) -> None:
+    """Bound implicit native thread pools when CUDA-Q tests can run.
+
+    Args:
+        markexpr (str): Active pytest marker expression.
+        environ (MutableMapping[str, str] | None): Environment mapping to
+            update. Defaults to ``os.environ``.
+    """
+    if not markexpr_can_select_cudaq(markexpr):
+        return
+    target = os.environ if environ is None else environ
+    for variable in NATIVE_THREAD_LIMIT_ENV:
+        target.setdefault(variable, "1")

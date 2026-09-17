@@ -25,7 +25,7 @@
 
 # %%
 # Install the latest Qamomile through pip!
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit]"
 
 # %% [markdown]
 # ---
@@ -199,7 +199,7 @@ def metropolis_hastings(
 # Let us run it to draw samples.
 
 # %%
-T = 100 if docs_test_mode else 1000  # Number of MCMC steps
+T = 1 if docs_test_mode else 1000  # Number of MCMC steps
 beta = 0.5  # Inverse temperature
 
 sample = np.zeros((T, n_spins))
@@ -338,10 +338,8 @@ for i in range(n_spins - 1):
 
 # %%
 import qamomile.circuit as qmc
-from qamomile.circuit.algorithm import (
-    computational_basis_state,
-    trotterized_time_evolution,
-)
+from qamomile.circuit.algorithm import trotterized_time_evolution
+from qamomile.circuit.stdlib import computational_basis_state
 
 
 @qmc.qkernel
@@ -384,9 +382,9 @@ from qamomile.qiskit import QiskitTranspiler
 gamma = 0.45  # Mixing coefficient
 time = 12.0  # Total evolution time
 delta_t = 0.8  # Trotter step size
-step = int(time / delta_t)  # Number of Trotter steps
+step = 1 if docs_test_mode else int(time / delta_t)  # Number of Trotter steps
 order = 2  # Suzuki-Trotter approximation order
-assert step == 15  # 12.0 / 0.8
+assert step == (1 if docs_test_mode else 15)
 
 Hs = [
     (1 - gamma) * mixer_hamiltonian,
@@ -492,9 +490,7 @@ def quantum_proposal(state: np.ndarray, executable: Any, executor: Any) -> np.nd
 from qiskit_aer import AerSimulator
 
 beta = 1.0  # Switch to a lower temperature where local updates mix slowly
-T_quantum = (
-    20 if docs_test_mode else 1000
-)  # Kept small because quantum-circuit simulation is costly
+T_quantum = 1 if docs_test_mode else 1000
 
 # Recompute the theoretical average magnetization for the new beta=1.0
 weights = np.exp(-beta * energies)

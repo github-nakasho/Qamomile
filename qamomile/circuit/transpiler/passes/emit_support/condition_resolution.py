@@ -11,7 +11,7 @@ from qamomile.circuit.ir.operation.gate import (
     MeasureVectorOperation,
     ProjectOperation,
 )
-from qamomile.circuit.ir.types.primitives import BitType
+from qamomile.circuit.ir.types.primitives import BitType, UIntType
 from qamomile.circuit.ir.value import (
     ArrayValue,
     Value,
@@ -202,7 +202,7 @@ def resolve_condition_address_detailed(
     """Resolve a condition / source ``Value`` to its ``clbit_map`` key.
 
     Single source of truth (shared by ``control_flow_emission.emit_if`` /
-    ``emit_while``, the Qiskit / CUDA-Q backends, ``ResourceAllocator``'s
+    ``emit_while``, the Qiskit / CUDA-Q engines, ``ResourceAllocator``'s
     loop-carried / merge aliasing, and the merge-output mapping helpers here)
     for turning a runtime control-flow condition — or a merge source Value —
     into the address its classical bit is registered under.
@@ -383,7 +383,7 @@ def _validate_runtime_bit_merge_partitions(
 def _coerce_to_bool(value: Any) -> bool | None:
     """Coerce a Python scalar to bool; return None for non-scalar values.
 
-    A backend-specific runtime expression (e.g. ``qiskit.circuit.classical.expr.Expr``)
+    An engine-specific runtime expression (e.g. ``qiskit.circuit.classical.expr.Expr``)
     may be stored in ``bindings`` for the same UUID slot as a compile-time
     Python bool. This guard ensures we don't accidentally call ``bool()`` on
     such an object — that would either raise or return a misleading truthy
@@ -469,7 +469,10 @@ def remap_static_merge_outputs(
         is_scalar_bit = isinstance(output.type, BitType) and not isinstance(
             output, ArrayValue
         )
-        if not is_scalar_bit and (
+        is_scalar_quantum = output.type.is_quantum() and not isinstance(
+            output, ArrayValue
+        )
+        if not (is_scalar_bit or is_scalar_quantum) and (
             QubitAddress(output.uuid) in qubit_map
             or QubitAddress(output.uuid) in clbit_map
         ):
@@ -491,6 +494,11 @@ def remap_static_merge_outputs(
                     phys = qubit_map.get(key)
                 if phys is not None:
                     qubit_map[QubitAddress(output.uuid)] = phys
+        elif isinstance(output.type, UIntType):
+            if resolver is not None and bindings is not None:
+                resolved_index = resolver.resolve_int_value(selected_val, bindings)
+                if resolved_index is not None:
+                    bindings[output.uuid] = resolved_index
         else:
             # Scalar Bit source: resolve vector-element sources (``s[i]``
             # from a measured ``Vector[Bit]``) to their root clbit key, not

@@ -25,7 +25,7 @@
 
 # %%
 # 最新のQamomileをQURI Parts用の追加依存と一緒にpipからインストールします。
-# # !pip install "qamomile[quri_parts]"
+# # !pip install "qamomile[quri_parts,visualization]"
 
 # %%
 # このチュートリアルで使うライブラリをここにまとめます。
@@ -98,10 +98,8 @@ plt.show()
 #
 # :::{tip}
 # Qamomileの回転ゲートは$e^{-i\theta/2}$という規約に従います。
-# そのため、$1/2$係数の扱いはコスト層とミキサー層で少し異なります。
-# ミキサー層では`rx`に$2\beta$を渡すので、$1/2$が打ち消され、教科書通りの$e^{-i\beta X}$になります。
-# 一方、コスト層では`rzz`に$J_{ij} \cdot \gamma$を渡すため、$1/2$は残ります。
-# この係数の違いは変分パラメータ$\gamma$に吸収しています。つまり、ここで使う$\gamma$は教科書のQAOAの$\gamma$の2倍に相当します。
+# `rx`には$2\beta$、`rzz`には$2J_{ij}\gamma$、`rz`には$2h_i\gamma$を渡します。
+# これによりすべての$1/2$が打ち消され、教科書通りの$e^{-i\beta X}$ミキサーと$e^{-i\gamma H_C}$コストユニタリを厳密に実装できます。
 # :::
 
 
@@ -123,9 +121,9 @@ def cost_layer(
     gamma: qmc.Float,
 ) -> qmc.Vector[qmc.Qubit]:
     for (i, j), Jij in quad.items():
-        q[i], q[j] = qmc.rzz(q[i], q[j], angle=Jij * gamma)
+        q[i], q[j] = qmc.rzz(q[i], q[j], angle=2.0 * Jij * gamma)
     for i, hi in linear.items():
-        q[i] = qmc.rz(q[i], angle=hi * gamma)
+        q[i] = qmc.rz(q[i], angle=2.0 * hi * gamma)
     return q
 
 
@@ -162,7 +160,8 @@ def qaoa_ansatz(
 # 一方、`gammas` / `betas`には値を渡さず、後で決めるパラメータとして残します。
 
 # %%
-p = 3  # QAOAの層数
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+p = 1 if docs_test_mode else 3  # QAOAの層数
 qaoa_ansatz.draw(
     p=p,
     quad=spin_model.quad,
@@ -234,9 +233,8 @@ rng = np.random.default_rng(42)
 init_params = rng.uniform(-np.pi / 2, np.pi / 2, 2 * p)
 init_gammas = list(init_params[:p])
 init_betas = list(init_params[p:])
-docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-sample_shots = 256 if docs_test_mode else 2000
-maxiter = 20 if docs_test_mode else 100
+sample_shots = 1 if docs_test_mode else 2000
+maxiter = 4 if docs_test_mode else 100
 
 # パラメータ化されたexecutableをサンプリングし、ビット列をIsingエネルギーへデコードします。
 sample_result = executable.sample(
@@ -459,6 +457,7 @@ assert np.isclose(energy_via_estimate, energy_unbound, atol=1e-10)
 # QURI Partsのsamplerやestimatorを差し替えたい場合は、`QuriPartsTranspiler.executor(sampler=..., estimator=...)`経由でsamplerやestimatorを渡すか、`QuriPartsExecutor(sampler=..., estimator=...)`を直接インスタンス化します。
 # 差し替えたexecutorは、上で使った`executor`の位置にそのまま当てはめられます。
 # samplerを変えても、量子カーネルをトランスパイルし直す必要はありません。
+# 独自のsampler（測定結果を生成する処理）は0以上の整数として表せる測定回数を返す必要があり、ideal sampler（確率から重みを計算する処理）などの小数の重みは`ValueError`になります。
 # `executable`が回路を持ち、`executor`が実行に使うsamplerやestimatorを持つ、という役割分担になっているためです。
 #
 # 具体例として、QURI PartsのQulacs用`NoiseSimulator`を使ったノイズ込みsamplerを構築します。

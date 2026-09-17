@@ -37,6 +37,7 @@ import qamomile.observable as qm_o
 from qamomile.optimization.binary_model import BinaryModel, BinarySampleSet, VarType
 from qamomile.optimization.converter import (
     binary_sampleset_to_ommx_samples,
+    evaluate_original_instance,
     normalize_problem_input,
 )
 from qamomile.optimization.qrao.rounding import SignRounder
@@ -265,7 +266,7 @@ class PCEConverter:
     :math:`s_i = \\operatorname{sgn}\\langle P_i \\rangle`.
 
     PCE does not prescribe a specific ansatz — users build their own
-    variational circuit and transpile it directly with their backend's
+    variational circuit and transpile it directly with their engine's
     :class:`~qamomile.circuit.transpiler.transpiler.Transpiler` (this
     converter does not wrap that step). The classical cost that the
     outer optimizer should minimize is
@@ -277,7 +278,7 @@ class PCEConverter:
 
     evaluated from the per-variable expectation values produced by the
     user's ansatz. Use :meth:`get_encoded_pauli_list` to obtain the
-    observables to feed into the backend's estimator.
+    observables to feed into the engine's estimator.
 
     The encoding is built once at construction (parametrized by
     ``correlator_order``) and cached on the encoder. To re-encode with a
@@ -310,7 +311,7 @@ class PCEConverter:
     Example:
         >>> converter = PCEConverter(instance, correlator_order=2)
         >>> observables = converter.get_encoded_pauli_list()
-        >>> # Transpile the user's ansatz directly with the backend
+        >>> # Transpile the user's ansatz directly with the engine
         >>> # transpiler (PCEConverter does not wrap this step):
         >>> executable = transpiler.transpile(
         ...     my_ansatz,
@@ -326,6 +327,9 @@ class PCEConverter:
         instance: ommx.v1.Instance | BinaryModel,
         correlator_order: int,
         num_qubits: int | None = None,
+        *,
+        uniform_penalty_weight: float | None = None,
+        penalty_weights: dict[int, float] | None = None,
     ) -> None:
         """Initialize the converter from an OMMX instance or BinaryModel.
 
@@ -351,6 +355,10 @@ class PCEConverter:
                 given, must be at least that minimum; supplying a larger
                 value is supported for callers that want to match a
                 specific hardware register width.
+            uniform_penalty_weight (float | None): Uniform OMMX constraint
+                penalty. ``None`` delegates weight selection to OMMX.
+            penalty_weights (dict[int, float] | None): Optional per-constraint
+                penalty weights keyed by constraint ID.
 
         Raises:
             TypeError: If ``instance`` is neither an ``ommx.v1.Instance``
@@ -361,11 +369,21 @@ class PCEConverter:
                 problem contains higher-order (HUBO) terms (raised by
                 :class:`PCEEncoder`).
         """
+        self.original_instance: ommx.v1.Instance | None
         self.instance: ommx.v1.Instance | None
         self.original_vartype: VarType
+        self.binary_model: BinaryModel
         self.spin_model: BinaryModel
-        self.instance, self.original_vartype, self.spin_model = normalize_problem_input(
-            instance
+        (
+            self.original_instance,
+            self.instance,
+            self.original_vartype,
+            self.binary_model,
+            self.spin_model,
+        ) = normalize_problem_input(
+            instance,
+            uniform_penalty_weight=uniform_penalty_weight,
+            penalty_weights=penalty_weights,
         )
         self._encoder: PCEEncoder = PCEEncoder(
             self.spin_model,
@@ -463,7 +481,7 @@ class PCEConverter:
         """Return the per-variable Pauli correlator observables.
 
         Returns the encoding as a list indexed by variable, suitable for
-        passing to a backend estimator to obtain :math:`\\langle P_i \\rangle`
+        passing to an engine estimator to obtain :math:`\\langle P_i \\rangle`
         for each variable.
 
         Returns:
@@ -541,6 +559,7 @@ class PCEConverter:
         # through the shared helper, and let evaluate_samples report the
         # original (un-penalized) objective and feasibility.
         if self.instance is not None:
+            assert self.original_instance is not None
             binary_sampleset = BinarySampleSet(
                 samples=[binary_sample],
                 num_occurrences=[1],
@@ -548,7 +567,11 @@ class PCEConverter:
                 vartype=VarType.BINARY,
             )
             ommx_samples = binary_sampleset_to_ommx_samples(binary_sampleset)
-            return self.instance.evaluate_samples(ommx_samples)
+            return evaluate_original_instance(
+                self.original_instance,
+                self.instance,
+                ommx_samples,
+            )
 
         # BinaryModel path: return in the model's original vartype.
         if self.original_vartype == VarType.BINARY:

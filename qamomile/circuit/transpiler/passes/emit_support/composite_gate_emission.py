@@ -9,7 +9,9 @@ variants. Each function takes an
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import re
 from typing import TYPE_CHECKING, Any
 
 from qamomile.circuit.ir.operation.callable import (
@@ -18,6 +20,9 @@ from qamomile.circuit.ir.operation.callable import (
     InvokeOperation,
 )
 from qamomile.circuit.transpiler.errors import EmitError
+from qamomile.circuit.transpiler.passes.emit_support.control_value_emission import (
+    bracket_control_value,
+)
 from qamomile.circuit.transpiler.passes.emit_support.physical_index_map import (
     map_array_result_group,
 )
@@ -79,11 +84,20 @@ def emit_composite_gate(
     ``EmitError`` if any operand cannot be resolved, rather than
     silently dropping it (previously ``qft(view)`` emitted zero gates).
 
+    Args:
+        emit_pass (StandardEmitPass): Active emit pass.
+        circuit (Any): Engine circuit being emitted into.
+        op (InvokeOperation): Composite or Oracle invocation to emit.
+        qubit_map (QubitMap): Logical-to-physical map, mutated with results.
+        bindings (dict[str, Any]): Bindings visible at the call site.
+
     Raises:
         EmitError: If any control or target qubit operand fails to
-            resolve to a physical qubit index.
+            resolve to a physical qubit index, or an inverse body is absent.
+        ValueError: If the selected implementation body disagrees with the
+            invocation contract.
     """
-    from qamomile.circuit.transpiler.passes.emit_support.controlled_emission import (
+    from qamomile.circuit.transpiler.passes.emit_support.controlled_block_support import (
         _expand_quantum_operands_to_phys,
     )
 
@@ -112,7 +126,7 @@ def emit_composite_gate(
         update_composite_result_mapping(op, qubit_groups, qubit_map)
         return
 
-    if op.transform is CallTransform.CONTROLLED:
+    if op.transform.is_controlled:
         from qamomile.circuit.transpiler.passes.emit_support.controlled_emission import (
             emit_controlled_composite_at_indices,
         )
@@ -128,14 +142,15 @@ def emit_composite_gate(
         update_composite_result_mapping(op, qubit_groups, qubit_map)
         return
 
-    if op.transform is CallTransform.INVERSE:
-        implementation = op.implementation_for(
-            backend=getattr(emit_pass, "backend_name", None)
-        )
-        if implementation is None or implementation.body is None:
+    if op.transform.is_inverse:
+        selection = op.select_body(engine=getattr(emit_pass, "engine_name", None))
+        if (
+            selection.body is None
+            or selection.realized_transform is not CallTransform.INVERSE
+        ):
             raise EmitError(
                 f"Inverse callable '{op.target.name}' has no inverse "
-                "implementation body for this backend. Bind structural "
+                "implementation body for this engine. Bind structural "
                 "parameters at compile time so the inverse can be "
                 "materialized, or register an inverse implementation.",
                 operation=f"InvokeOperation[{op.target.name}]",
@@ -143,14 +158,14 @@ def emit_composite_gate(
         emit_pass._emit_custom_composite(
             circuit,
             op,
-            implementation.body,
+            selection.body,
             qubit_indices,
             bindings,
         )
         update_composite_result_mapping(op, qubit_groups, qubit_map)
         return
 
-    # Try backend-global native emitters after callable-specific implementations.
+    # Try engine-global native emitters after callable-specific implementations.
     for emitter in emit_pass._composite_emitters:
         if emitter.can_emit(op.gate_type):
             if emitter.emit(circuit, op, qubit_indices, bindings):
@@ -173,7 +188,7 @@ def emit_invoke_operation(
 
     Args:
         emit_pass (StandardEmitPass): Active emit pass.
-        circuit (Any): Backend circuit being emitted.
+        circuit (Any): Engine circuit being emitted.
         op (InvokeOperation): Invocation to emit.
         qubit_map (QubitMap): Current qubit allocation map.
         bindings (dict[str, Any]): Active emit bindings.
@@ -182,9 +197,9 @@ def emit_invoke_operation(
         EmitError: If the invocation is opaque and has neither an executable
             body nor a selected native emitter.
     """
-    backend_name = getattr(emit_pass, "backend_name", None)
-    body = op.effective_body(backend=backend_name)
-    impl = op.implementation_for(backend=backend_name)
+    engine_name = getattr(emit_pass, "engine_name", None)
+    body = op.effective_body(engine=engine_name)
+    impl = op.implementation_for(engine=engine_name)
     has_native_emitter = impl is not None and impl.emitter is not None
     if body is None and op.attrs.get("kind") == "oracle" and not has_native_emitter:
         raise EmitError(
@@ -204,7 +219,7 @@ def emit_invoke_operation(
     ):
         raise EmitError(
             f"Composite '{op.target.name}' has an opaque cost for estimation "
-            "but no executable body or native emitter for this backend; it "
+            "but no executable body or native emitter for this engine; it "
             "cannot be transpiled to an executable circuit.",
             operation=f"InvokeOperation[{op.target.name}]",
         )
@@ -231,8 +246,8 @@ def emit_composite_fallback(
     elif op.gate_type == CompositeGateType.IQFT:
         emit_iqft_with_strategy(emit_pass, circuit, op, qubit_indices)
     else:
-        backend_name = getattr(emit_pass, "backend_name", None)
-        impl = op.effective_body(backend=backend_name)
+        engine_name = getattr(emit_pass, "engine_name", None)
+        impl = op.effective_body(engine=engine_name)
         if impl is not None:
             # _emit_custom_composite lives in controlled_emission module;
             # call via emit_pass so CudaqEmitPass overrides are respected.
@@ -252,7 +267,7 @@ def emit_callable_implementation_emitter(
 
     Args:
         emit_pass (StandardEmitPass): Active emit pass.
-        circuit (Any): Backend circuit being emitted.
+        circuit (Any): Engine circuit being emitted.
         op (InvokeOperation): Invocation to emit.
         qubit_indices (list[int]): Physical qubit indices in operand order.
         bindings (dict[str, Any]): Active emit bindings.
@@ -263,9 +278,11 @@ def emit_callable_implementation_emitter(
     Raises:
         EmitError: If the selected emitter object does not provide a callable
             ``emit`` method.
+        RuntimeError: If a declining emitter removed or replaced circuit state
+            that existed before its append-only emission attempt.
     """
-    backend_name = getattr(emit_pass, "backend_name", None)
-    impl = op.implementation_for(backend=backend_name)
+    engine_name = getattr(emit_pass, "engine_name", None)
+    impl = op.implementation_for(engine=engine_name)
     if impl is None or impl.emitter is None:
         return False
 
@@ -276,7 +293,30 @@ def emit_callable_implementation_emitter(
             "emitter without an emit() method.",
             operation=f"InvokeOperation[{op.target.name}]",
         )
-    return bool(emit(circuit, op, qubit_indices, bindings))
+    own_controls = qubit_indices[: op.num_control_qubits]
+    normalized_op = op
+    if op.control_value is not None:
+        normalized_attrs = dict(op.attrs)
+        normalized_attrs.pop("control_value", None)
+        normalized_op = dataclasses.replace(op, attrs=normalized_attrs)
+    snapshot_state = getattr(circuit, "snapshot_state", None)
+    restore_state = getattr(circuit, "restore_state", None)
+    circuit_snapshot = (
+        snapshot_state()
+        if callable(snapshot_state) and callable(restore_state)
+        else None
+    )
+    with bracket_control_value(
+        emit_pass,
+        circuit,
+        own_controls,
+        op.control_value,
+    ):
+        handled = bool(emit(circuit, normalized_op, qubit_indices, bindings))
+    if not handled and circuit_snapshot is not None:
+        assert callable(restore_state)
+        restore_state(circuit_snapshot)
+    return handled
 
 
 def emit_qft_with_strategy(
@@ -287,13 +327,13 @@ def emit_qft_with_strategy(
 ) -> None:
     """Emit QFT considering strategy selection.
 
-    If a strategy is specified and 'approximate', uses truncated rotations.
+    If ``approximate_kN`` is selected, omits rotations beyond depth ``N``.
     Otherwise falls back to standard QFT.
 
     Args:
         emit_pass (StandardEmitPass): The active emit pass whose emitter
             should receive decomposed QFT gates.
-        circuit (Any): Backend circuit being emitted.
+        circuit (Any): Engine circuit being emitted.
         op (InvokeOperation): Invocation expected to be a QFT.
         qubit_indices (list[int]): Physical qubit indices for the QFT target
             register.
@@ -303,17 +343,8 @@ def emit_qft_with_strategy(
     """
     _ensure_composite_gate_type(op, CompositeGateType.QFT, "emit_qft_with_strategy")
 
-    strategy_name = op.strategy_name
-
-    # Check if using approximate strategy
-    if strategy_name and "approximate" in strategy_name:
-        # Extract truncation depth from strategy name (e.g., "approximate_k3")
-        truncation_depth = 3  # default
-        if "_k" in strategy_name:
-            try:
-                truncation_depth = int(strategy_name.split("_k")[1])
-            except (ValueError, IndexError):
-                pass
+    truncation_depth = _qft_truncation_depth(op.strategy_name, "QFT")
+    if truncation_depth is not None:
         emit_approximate_qft(emit_pass, circuit, qubit_indices, truncation_depth)
     else:
         emit_qft_manual(emit_pass, circuit, qubit_indices)
@@ -327,13 +358,13 @@ def emit_iqft_with_strategy(
 ) -> None:
     """Emit IQFT considering strategy selection.
 
-    If a strategy is specified and 'approximate', uses truncated rotations.
+    If ``approximate_kN`` is selected, omits rotations beyond depth ``N``.
     Otherwise falls back to standard IQFT.
 
     Args:
         emit_pass (StandardEmitPass): The active emit pass whose emitter
             should receive decomposed IQFT gates.
-        circuit (Any): Backend circuit being emitted.
+        circuit (Any): Engine circuit being emitted.
         op (InvokeOperation): Invocation expected to be an IQFT.
         qubit_indices (list[int]): Physical qubit indices for the IQFT target
             register.
@@ -343,18 +374,38 @@ def emit_iqft_with_strategy(
     """
     _ensure_composite_gate_type(op, CompositeGateType.IQFT, "emit_iqft_with_strategy")
 
-    strategy_name = op.strategy_name
-
-    if strategy_name and "approximate" in strategy_name:
-        truncation_depth = 3
-        if "_k" in strategy_name:
-            try:
-                truncation_depth = int(strategy_name.split("_k")[1])
-            except (ValueError, IndexError):
-                pass
+    truncation_depth = _qft_truncation_depth(op.strategy_name, "IQFT")
+    if truncation_depth is not None:
         emit_approximate_iqft(emit_pass, circuit, qubit_indices, truncation_depth)
     else:
         emit_iqft_manual(emit_pass, circuit, qubit_indices)
+
+
+def _qft_truncation_depth(strategy_name: str | None, operation: str) -> int | None:
+    """Validate a QFT strategy and return its truncation depth.
+
+    Args:
+        strategy_name (str | None): Strategy metadata from the invocation.
+        operation (str): ``"QFT"`` or ``"IQFT"`` for diagnostics.
+
+    Returns:
+        int | None: Positive approximate depth, or ``None`` for exact
+        emission.
+
+    Raises:
+        EmitError: If the strategy is not ``exact`` or
+            ``approximate_k<positive integer>``.
+    """
+    if strategy_name in (None, "exact"):
+        return None
+    match = re.fullmatch(r"approximate_k([1-9][0-9]*)", strategy_name)
+    if match is None:
+        raise EmitError(
+            f"Invalid {operation} strategy {strategy_name!r}; expected "
+            "'exact' or 'approximate_k<positive integer>'.",
+            operation=f"InvokeOperation[{operation}]",
+        )
+    return int(match.group(1))
 
 
 def emit_approximate_qft(
@@ -509,7 +560,7 @@ def emit_qpe_manual(
     Args:
         emit_pass (StandardEmitPass): The active emit pass whose emitter
             should receive decomposed QPE gates.
-        circuit (Any): Backend circuit being emitted.
+        circuit (Any): Engine circuit being emitted.
         op (InvokeOperation): Invocation expected to be a QPE.
         qubit_indices (list[int]): Physical qubit indices for counting and
             target registers, in operation operand order.
@@ -539,7 +590,10 @@ def emit_qpe_manual(
         block_value = op.operands[0]
 
         local_bindings = emit_pass._resolver.bind_block_params(
-            block_value, op.parameters, bindings
+            block_value,
+            op.parameters,
+            bindings,
+            parameter_factory=emit_pass._get_or_create_parameter,
         )
 
         # _emit_controlled_powers lives in controlled_emission module;

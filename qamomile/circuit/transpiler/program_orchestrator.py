@@ -5,8 +5,12 @@ This module is internal. Users interact with ExecutableProgram.sample()/run().
 
 from __future__ import annotations
 
+import math
 import numbers
-from typing import Any, Generic, TypeVar
+from collections.abc import Iterator
+from typing import Any, Generic, TypeVar, cast
+
+import numpy as np
 
 from qamomile.circuit.ir.value import (
     ArrayValue,
@@ -26,13 +30,29 @@ from qamomile.circuit.transpiler.compiled_segments import (
 )
 from qamomile.circuit.transpiler.errors import ExecutionError
 from qamomile.circuit.transpiler.execution_context import ExecutionContext
-from qamomile.circuit.transpiler.job import ExpvalJob, RunJob, SampleJob
-from qamomile.circuit.transpiler.param_keys import (
-    dict_param_key,
-    is_decomposable_dict_binding_key,
-    normalize_dict_binding_key,
+from qamomile.circuit.transpiler.execution_handle import (
+    CompositeExecutionHandle,
+    ExecutionHandle,
+    MappedExecutionHandle,
 )
-from qamomile.circuit.transpiler.parameter_binding import ParameterMetadata
+from qamomile.circuit.transpiler.execution_request import (
+    CircuitInvocation,
+    EstimateRequest,
+    EstimationAccuracy,
+    SampleRequest,
+)
+from qamomile.circuit.transpiler.execution_snapshot import ExecutionSnapshotKind
+from qamomile.circuit.transpiler.job import (
+    ExpvalJob,
+    JobKind,
+    JobSnapshot,
+    RunJob,
+    SampleJob,
+)
+from qamomile.circuit.transpiler.parameter_binding import (
+    ParameterMetadata,
+    flatten_user_bindings,
+)
 from qamomile.circuit.transpiler.quantum_executor import QuantumExecutor
 from qamomile.circuit.transpiler.segments import (
     ClassicalStep,
@@ -46,7 +66,7 @@ if __builtins__:  # always True; avoids circular import at module level
     if TYPE_CHECKING:
         from qamomile.circuit.transpiler.executable import ExecutableProgram
 
-T = TypeVar("T")  # Backend circuit type
+T = TypeVar("T")  # Engine circuit type
 _MISSING = object()
 
 
@@ -71,9 +91,214 @@ class ProgramOrchestrator(Generic[T]):
         shots: int,
         bindings: dict[str, Any] | None,
     ) -> SampleJob[Any]:
-        """Execute with multiple shots and return counts."""
-        program = self._program
+        """Submit sampling and return a lazy typed-result job.
 
+        Args:
+            executor (QuantumExecutor[T]): Engine execution adapter.
+            shots (int): Positive number of requested samples.
+            bindings (dict[str, Any] | None): Runtime public bindings.
+
+        Returns:
+            SampleJob[Any]: Deferred typed sample job.
+
+        Raises:
+            ExecutionError: If the plan contains expectation-value steps.
+            ValueError: If shots or runtime bindings are invalid.
+        """
+        return self._create_sample_job(executor, shots, bindings)
+
+    def run(
+        self,
+        executor: QuantumExecutor[T],
+        bindings: dict[str, Any] | None,
+        estimation: EstimationAccuracy | None = None,
+    ) -> RunJob[Any] | ExpvalJob:
+        """Submit one execution and return its lazy public job.
+
+        Args:
+            executor (QuantumExecutor[T]): Engine execution adapter.
+            bindings (dict[str, Any] | None): Runtime public bindings.
+            estimation (EstimationAccuracy | None): Optional expectation
+                accuracy policy. Defaults to the executor configuration.
+
+        Returns:
+            RunJob[Any] | ExpvalJob: Deferred public result job.
+        """
+        return self._create_run_job(executor, bindings, estimation)
+
+    def restore(
+        self,
+        executor: QuantumExecutor[T],
+        snapshot: JobSnapshot,
+        bindings: dict[str, Any] | None,
+    ) -> SampleJob[Any] | RunJob[Any] | ExpvalJob:
+        """Restore provider executions and rebuild the typed public job.
+
+        Args:
+            executor (QuantumExecutor[T]): Engine adapter configured with the
+                credentials and target needed to restore provider jobs.
+            snapshot (JobSnapshot): Operation metadata and provider references
+                captured from the original public job.
+            bindings (dict[str, Any] | None): Original runtime bindings used to
+                rebuild classical pre- and post-processing context.
+
+        Returns:
+            SampleJob[Any] | RunJob[Any] | ExpvalJob: Lazy typed job with the
+                same public result conversion as the original execution.
+
+        Raises:
+            ExecutionError: If the snapshot reference shape does not match the
+                executable program.
+            NotImplementedError: If the executor cannot restore a reference.
+            ValueError: If runtime bindings or snapshot metadata are invalid.
+            TypeError: If mutable snapshot values have unsupported types.
+        """
+        snapshot = JobSnapshot.from_dict(snapshot.to_dict())
+        self._validate_snapshot_execution(snapshot)
+        if snapshot.kind is JobKind.SAMPLE:
+            if snapshot.execution is not None:
+                raw_execution = snapshot.execution.restore(executor.restore)
+            elif len(snapshot.executions) != 1:
+                raise ExecutionError(
+                    "A sample snapshot must contain one logical execution reference"
+                )
+            else:
+                raw_execution = executor.restore(snapshot.executions[0])
+            execution = cast(
+                ExecutionHandle[dict[str, int]],
+                raw_execution,
+            )
+            return self._create_sample_job(
+                executor,
+                cast(int, snapshot.shots),
+                bindings,
+                execution,
+            )
+        restored = (
+            (snapshot.execution.restore(executor.restore),)
+            if snapshot.execution is not None
+            else tuple(executor.restore(item) for item in snapshot.executions)
+        )
+        return self._create_run_job(
+            executor,
+            bindings,
+            restored_executions=restored,
+        )
+
+    def _validate_snapshot_execution(self, snapshot: JobSnapshot) -> None:
+        """Check known raw result shape before contacting a provider.
+
+        Args:
+            snapshot (JobSnapshot): Validated serialized job metadata.
+
+        Raises:
+            ExecutionError: If local values or group arity do not satisfy the
+                executable's counts or finite float estimate result contract,
+                or a counts-based run does not contain exactly one shot.
+        """
+        execution = snapshot.execution
+        if execution is None:
+            return
+        expected_estimates = sum(
+            isinstance(step, ExpvalStep)
+            for step in (self._program.plan.steps if self._program.plan else ())
+        )
+        if snapshot.kind is JobKind.SAMPLE and expected_estimates:
+            raise ExecutionError("An expectation program cannot restore a sample job")
+        if not expected_estimates:
+            if execution.kind is ExecutionSnapshotKind.COMPOSITE:
+                raise ExecutionError("A counts snapshot must contain one execution")
+            if execution.kind is ExecutionSnapshotKind.LOCAL:
+                counts = execution.value
+                if type(counts) is not dict or any(
+                    type(key) is not str
+                    or any(bit not in "01" for bit in key)
+                    or type(count) is not int
+                    or count < 0
+                    for key, count in counts.items()
+                ):
+                    raise ExecutionError(
+                        "Local counts snapshot must contain binary string keys "
+                        "and nonnegative integer counts"
+                    )
+                if snapshot.kind is JobKind.RUN and (
+                    len(counts) != 1 or next(iter(counts.values())) != 1
+                ):
+                    raise ExecutionError(
+                        "Local run counts snapshot must contain exactly one "
+                        "bitstring with count 1"
+                    )
+            return
+
+        if execution.kind is ExecutionSnapshotKind.REMOTE:
+            return
+        if execution.kind is ExecutionSnapshotKind.COMPOSITE:
+            if len(execution.children) != expected_estimates:
+                raise ExecutionError(
+                    "Snapshot expectation group count does not match the program: "
+                    f"expected={expected_estimates}, actual={len(execution.children)}"
+                )
+            if any(
+                child.kind is ExecutionSnapshotKind.COMPOSITE
+                for child in execution.children
+            ):
+                raise ExecutionError(
+                    "Each expectation snapshot child must produce one real scalar"
+                )
+            values = tuple(
+                child.value
+                for child in execution.children
+                if child.kind is ExecutionSnapshotKind.LOCAL
+            )
+        else:
+            values = (
+                execution.value
+                if isinstance(execution.value, tuple)
+                else (execution.value,)
+            )
+            if len(values) != expected_estimates:
+                raise ExecutionError(
+                    "Local expectation result count does not match the program"
+                )
+        try:
+            invalid_values = any(
+                type(value) not in (float, int) or not math.isfinite(value)
+                for value in values
+            )
+        except OverflowError as exc:
+            raise ExecutionError(
+                "Local expectation snapshots must contain real scalars "
+                "within the finite float range"
+            ) from exc
+        if invalid_values:
+            raise ExecutionError(
+                "Local expectation snapshots must contain real scalars"
+            )
+
+    def _create_sample_job(
+        self,
+        executor: QuantumExecutor[T],
+        shots: int,
+        bindings: dict[str, Any] | None,
+        execution: ExecutionHandle[dict[str, int]] | None = None,
+    ) -> SampleJob[Any]:
+        """Build a typed sample job around new or restored raw execution.
+
+        Args:
+            executor (QuantumExecutor[T]): Engine execution adapter.
+            shots (int): Positive number of requested samples.
+            bindings (dict[str, Any] | None): Runtime public bindings.
+            execution (ExecutionHandle[dict[str, int]] | None): Restored raw
+                counts handle. ``None`` submits a new request.
+
+        Returns:
+            SampleJob[Any]: Deferred typed sample job.
+
+        Raises:
+            ExecutionError: If the plan contains expectation-value steps.
+            ValueError: If shots or runtime bindings are invalid.
+        """
+        program = self._program
         if program.plan and any(
             isinstance(step, ExpvalStep) for step in program.plan.steps
         ):
@@ -83,75 +308,249 @@ class ProgramOrchestrator(Generic[T]):
             )
 
         indexed_bindings = self._convert_user_bindings(bindings)
+        self._validate_user_array_bindings(bindings)
         context = self._create_execution_context(bindings, indexed_bindings)
-        circuit = self._prepare_quantum_execution(context, executor)
-
-        raw_counts = executor.execute(circuit, shots)
+        invocation = self._prepare_quantum_invocation(context)
+        if execution is None:
+            execution = executor.submit_sample(SampleRequest(invocation, shots))
 
         def convert_counts(raw_counts: dict[str, int]) -> list[tuple[Any, int]]:
+            """Convert engine counts through the program's public ABI.
+
+            Args:
+                raw_counts (dict[str, int]): Engine-normalized bitstring
+                    counts.
+
+            Returns:
+                list[tuple[Any, int]]: Typed public values and counts.
+            """
             results: list[tuple[Any, int]] = []
             for bitstring, count in raw_counts.items():
                 shot_context = context.copy()
                 bits = self._bitstring_to_tuple(bitstring)
                 self._load_measurements(shot_context, bits)
-                self._execute_post_quantum_steps(shot_context, executor, circuit)
-
-                if program.output_values:
-                    value = self._resolve_outputs(shot_context)
-                else:
-                    value = bits
+                self._execute_post_quantum_steps(
+                    shot_context,
+                    executor,
+                    invocation.circuit,
+                )
+                value = (
+                    self._resolve_outputs(shot_context)
+                    if program.output_values
+                    else self._resolve_implicit_outputs(bits)
+                )
                 results.append((value, count))
             return results
 
-        return SampleJob(raw_counts, convert_counts, shots)
+        return SampleJob(execution, convert_counts, shots)
 
-    def run(
+    def _create_run_job(
         self,
         executor: QuantumExecutor[T],
         bindings: dict[str, Any] | None,
+        estimation: EstimationAccuracy | None = None,
+        restored_executions: tuple[ExecutionHandle[Any], ...] | None = None,
     ) -> RunJob[Any] | ExpvalJob:
-        """Execute once and return single result."""
+        """Build a typed run job around new or restored raw execution.
+
+        Args:
+            executor (QuantumExecutor[T]): Engine execution adapter.
+            bindings (dict[str, Any] | None): Runtime public bindings.
+            estimation (EstimationAccuracy | None): Accuracy policy for a new
+                expectation submission. Ignored for restored execution.
+            restored_executions (tuple[ExecutionHandle[Any], ...] | None):
+                Ordered restored handles. ``None`` submits a new request.
+
+        Returns:
+            RunJob[Any] | ExpvalJob: Deferred public result job.
+
+        Raises:
+            ExecutionError: If restored references do not match the program's
+                logical execution shape.
+            ValueError: If runtime bindings are invalid.
+        """
         program = self._program
-
         indexed_bindings = self._convert_user_bindings(bindings)
+        self._validate_user_array_bindings(bindings)
         context = self._create_execution_context(bindings, indexed_bindings)
-        circuit = self._prepare_quantum_execution(context, executor)
+        invocation = self._prepare_quantum_invocation(context)
 
-        if program.plan and any(
-            isinstance(step, ExpvalStep) for step in program.plan.steps
-        ):
-            result = self._execute_post_quantum_steps(context, executor, circuit)
-            if not any(isinstance(step, ClassicalStep) for step in program.plan.steps):
-                return ExpvalJob(float(result))
-            return RunJob({"": 1}, lambda _: result)
+        has_expval = bool(
+            program.plan
+            and any(isinstance(step, ExpvalStep) for step in program.plan.steps)
+        )
+        if has_expval:
+            requests = self._prepare_expval_requests(invocation, estimation)
+            if restored_executions is None:
+                estimates = executor.submit_estimates(requests)
+            else:
+                estimates = self._restore_estimate_group(
+                    restored_executions,
+                    len(requests),
+                )
 
-        raw_counts = executor.execute(circuit, shots=1)
+            def complete_expval(values: tuple[float, ...]) -> Any:
+                """Finish host post-processing after estimates complete.
+
+                Args:
+                    values (tuple[float, ...]): Expectation values in plan
+                        order.
+
+                Returns:
+                    Any: Final public kernel value.
+                """
+                return self._execute_post_quantum_steps(
+                    context,
+                    executor,
+                    invocation.circuit,
+                    expval_values=iter(values),
+                )
+
+            result_handle = MappedExecutionHandle(
+                estimates, complete_expval, snapshot_source=True
+            )
+            if (
+                len(program.compiled_expval) == 1
+                and program.plan is not None
+                and not any(
+                    isinstance(step, ClassicalStep) for step in program.plan.steps
+                )
+            ):
+                return ExpvalJob(result_handle)
+            return RunJob.from_handle(result_handle)
+
+        if restored_executions is None:
+            execution = executor.submit_sample(SampleRequest(invocation, shots=1))
+        elif len(restored_executions) == 1:
+            execution = cast(ExecutionHandle[dict[str, int]], restored_executions[0])
+        else:
+            raise ExecutionError(
+                "A non-expectation run snapshot must contain one logical "
+                "execution reference"
+            )
 
         def convert_result(bitstring: str) -> Any:
+            """Convert one engine bitstring through the program's public ABI.
+
+            Args:
+                bitstring (str): Engine-normalized measured bitstring.
+
+            Returns:
+                Any: Typed public kernel result.
+            """
             run_context = context.copy()
             bits = self._bitstring_to_tuple(bitstring)
             self._load_measurements(run_context, bits)
-            self._execute_post_quantum_steps(run_context, executor, circuit)
+            self._execute_post_quantum_steps(
+                run_context,
+                executor,
+                invocation.circuit,
+            )
+            return (
+                self._resolve_outputs(run_context)
+                if program.output_values
+                else self._resolve_implicit_outputs(bits)
+            )
 
-            if program.output_values:
-                return self._resolve_outputs(run_context)
-            return bits
+        return RunJob(execution, convert_result)
 
-        return RunJob(raw_counts, convert_result)
+    @staticmethod
+    def _restore_estimate_group(
+        executions: tuple[ExecutionHandle[Any], ...],
+        expected_results: int,
+    ) -> ExecutionHandle[tuple[float, ...]]:
+        """Reconstruct the ordered expectation result group.
+
+        A native provider batch may expose one reference for several logical
+        estimates, while compatibility execution exposes one reference per
+        estimate. Both shapes normalize to one tuple-valued handle.
+
+        Args:
+            executions (tuple[ExecutionHandle[Any], ...]): Restored provider
+                handles in snapshot order.
+            expected_results (int): Number of expectation values required by
+                the executable plan.
+
+        Returns:
+            ExecutionHandle[tuple[float, ...]]: Tuple-valued estimate handle.
+
+        Raises:
+            ExecutionError: If restored results have incompatible arity or
+                types, or a scalar cannot be converted to a float.
+        """
+        if len(executions) == 1:
+
+            def normalize(value: Any) -> tuple[float, ...]:
+                """Normalize a scalar or native batch result to a float tuple.
+
+                Args:
+                    value (Any): Restored scalar or ordered provider result.
+
+                Returns:
+                    tuple[float, ...]: Ordered expectation values.
+
+                Raises:
+                    ExecutionError: If the result arity differs from the plan,
+                        a scalar is not real, or float conversion fails.
+                """
+                values = value if isinstance(value, tuple) else (value,)
+                if len(values) != expected_results:
+                    raise ExecutionError(
+                        "Restored expectation result count does not match the "
+                        f"program: expected={expected_results}, actual={len(values)}"
+                    )
+                if any(
+                    isinstance(item, bool) or not isinstance(item, numbers.Real)
+                    for item in values
+                ):
+                    raise ExecutionError(
+                        "Restored expectation results must be real scalar values; "
+                        "nested groups cannot replace individual expectations"
+                    )
+                try:
+                    return tuple(float(item) for item in values)
+                except (OverflowError, TypeError, ValueError) as exc:
+                    raise ExecutionError(
+                        "Restored expectation results must be real scalar values "
+                        "representable as float values"
+                    ) from exc
+
+            return MappedExecutionHandle(executions[0], normalize, snapshot_source=True)
+
+        if len(executions) != expected_results:
+            raise ExecutionError(
+                "Restored expectation reference count does not match the "
+                f"program: expected={expected_results}, actual={len(executions)}"
+            )
+        return ProgramOrchestrator._restore_estimate_group(
+            (CompositeExecutionHandle(executions),), expected_results
+        )
 
     def run_expval(
         self,
         executor: QuantumExecutor[T],
         bindings: dict[str, Any] | None,
+        estimation: EstimationAccuracy | None = None,
     ) -> ExpvalJob:
-        """Backward-compatible helper for pure expval execution."""
-        indexed_bindings = self._convert_user_bindings(bindings)
-        context = self._create_execution_context(bindings, indexed_bindings)
-        circuit = self._prepare_quantum_execution(context, executor)
-        result_value = self._execute_post_quantum_steps(context, executor, circuit)
-        if result_value is None:
-            raise ExecutionError("No expectation value computed")
-        return ExpvalJob(float(result_value))
+        """Submit a pure expectation execution through the public run path.
+
+        Args:
+            executor (QuantumExecutor[T]): Engine execution adapter.
+            bindings (dict[str, Any] | None): Runtime public bindings.
+            estimation (EstimationAccuracy | None): Optional expectation
+                accuracy policy.
+
+        Returns:
+            ExpvalJob: Deferred expectation result.
+
+        Raises:
+            ExecutionError: If the program does not produce a pure
+                expectation job.
+        """
+        job = self.run(executor, bindings, estimation)
+        if not isinstance(job, ExpvalJob):
+            raise ExecutionError("No pure expectation value computation found")
+        return job
 
     # ------------------------------------------------------------------
     # Binding conversion and validation
@@ -161,68 +560,49 @@ class ProgramOrchestrator(Generic[T]):
     def _convert_user_bindings(
         bindings: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Convert user-friendly bindings to indexed format.
-
-        Sequence values (array parameters) expand positionally to
-        ``name[0]``, ``name[1]``, ...; dict values (Dict runtime
-        parameters) expand per key to ``name[<key>]`` using the same
-        naming the emit pass used when creating the backend parameters.
+        """Convert public bindings into the scalar engine ABI.
 
         Args:
-            bindings (dict[str, Any] | None): User-supplied bindings
-                keyed by kernel argument name. ``None`` means no
-                bindings.
+            bindings (dict[str, Any] | None): Raw public runtime bindings.
 
         Returns:
-            dict[str, Any]: Flat mapping from backend parameter names to
-                scalar values, with non-container bindings passed
-                through unchanged.
+            dict[str, Any]: Flattened scalar and dictionary binding map.
         """
-        if bindings is None:
-            return {}
-
-        import numpy as np
-
-        result: dict[str, Any] = {}
-        for key, value in bindings.items():
-            if isinstance(value, (list, tuple, np.ndarray)):
-                for i, v in enumerate(value):
-                    result[f"{key}[{i}]"] = v
-            elif isinstance(value, dict):
-                for k, v in value.items():
-                    normalized = normalize_dict_binding_key(k)
-                    # Keys that can never match an emitted parameter name
-                    # (str, non-integer floats, ...) must not be string-
-                    # formatted: "1" would collide with the int key 1
-                    # (both format as name[1]) and bind the wrong
-                    # parameter. Leaving them out means a genuinely
-                    # missing integer key still errors loudly downstream.
-                    if not is_decomposable_dict_binding_key(normalized):
-                        continue
-                    result[dict_param_key(key, normalized)] = v
-            else:
-                result[key] = value
-        return result
+        return flatten_user_bindings(bindings)
 
     @staticmethod
     def _validate_bindings(
         indexed_bindings: dict[str, Any],
         parameter_metadata: ParameterMetadata,
     ) -> None:
-        """Validate that all required parameters are bound."""
-        required = {p.name for p in parameter_metadata.parameters}
-        provided = set(indexed_bindings.keys())
-        missing = required - provided
+        """Validate that every emitted scalar slot has a runtime value.
 
-        if missing:
-            array_names = {
-                p.array_name for p in parameter_metadata.parameters if p.name in missing
-            }
-            raise ValueError(
-                f"Missing parameter bindings: {sorted(missing)}. "
-                f"Provide bindings for: {sorted(array_names)} "
-                f"(e.g., bindings={{'{list(array_names)[0] if array_names else 'param'}': [...]}})"
-            )
+        Args:
+            indexed_bindings (dict[str, Any]): Flattened runtime bindings.
+            parameter_metadata (ParameterMetadata): Compiled parameter ABI.
+
+        Raises:
+            ValueError: If one or more emitted scalar slots are missing.
+        """
+        parameter_metadata.validate_required_bindings(indexed_bindings)
+
+    def _validate_user_array_bindings(
+        self,
+        bindings: dict[str, Any] | None,
+    ) -> None:
+        """Validate public arrays against the merged compiled ABI.
+
+        Args:
+            bindings (dict[str, Any] | None): Raw public runtime bindings.
+
+        Raises:
+            ValueError: If a runtime array has invalid rank or exceeds a
+                concrete emitted dimension.
+        """
+        metadata = ParameterMetadata.merge(
+            [segment.parameter_metadata for segment in self._program.compiled_quantum]
+        )
+        metadata.validate_array_shapes(bindings)
 
     # ------------------------------------------------------------------
     # Execution context and measurement handling
@@ -421,7 +801,7 @@ class ProgramOrchestrator(Generic[T]):
 
     @staticmethod
     def _bitstring_to_tuple(bitstring: str) -> tuple[int, ...]:
-        """Convert a backend bitstring to little-endian tuple order."""
+        """Convert an engine bitstring to little-endian tuple order."""
         return tuple(int(b) for b in reversed(bitstring))
 
     def _load_measurements(
@@ -441,23 +821,71 @@ class ProgramOrchestrator(Generic[T]):
             if bit_idx < len(bits):
                 context.set(str(addr), bits[bit_idx])
 
+    def _resolve_implicit_outputs(
+        self,
+        bits: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Project a raw engine bitstring onto logical implicit outputs.
+
+        Args:
+            bits (tuple[int, ...]): Full little-endian engine bitstring.
+
+        Returns:
+            tuple[int, ...]: Logical qubit values in the materializer-declared
+                order, or the unchanged raw values when no mapping is declared.
+
+        Raises:
+            ExecutionError: If materializer metadata references a missing
+                physical qubit.
+        """
+        compiled_quantum = self._program.compiled_quantum
+        if not compiled_quantum:
+            return bits
+        indices = compiled_quantum[0].implicit_output_qubit_indices
+        if indices is None:
+            return bits
+        if any(index < 0 or index >= len(bits) for index in indices):
+            raise ExecutionError(
+                "Implicit output metadata references a qubit outside the "
+                f"engine bitstring: indices={indices}, width={len(bits)}"
+            )
+        return tuple(bits[index] for index in indices)
+
     # ------------------------------------------------------------------
     # Quantum execution preparation
     # ------------------------------------------------------------------
 
-    def _prepare_quantum_execution(
+    def _prepare_quantum_invocation(
         self,
         context: ExecutionContext,
-        executor: QuantumExecutor[T],
-    ) -> T:
-        """Execute pre-quantum classical steps and bind the quantum circuit."""
+    ) -> CircuitInvocation[T]:
+        """Execute classical preparation and preserve engine runtime inputs.
+
+        Args:
+            context (ExecutionContext): Runtime values and public bindings.
+
+        Returns:
+            CircuitInvocation[T]: Circuit plus unresolved engine inputs.
+
+        Raises:
+            ExecutionError: If no quantum circuit exists in the plan.
+            ValueError: If a required runtime binding is missing.
+        """
         program = self._program
 
         if program.plan is None:
-            circuit = program.get_first_circuit()
-            if circuit is None:
+            compiled = program.compiled_quantum[0] if program.compiled_quantum else None
+            if compiled is None:
                 raise ExecutionError("No quantum circuit to execute")
-            return circuit
+            bindings = self._resolve_quantum_bindings(
+                context,
+                compiled.parameter_metadata,
+            )
+            return CircuitInvocation(
+                compiled.circuit,
+                bindings,
+                compiled.parameter_metadata,
+            )
 
         classical_executor = ClassicalExecutor()
         for step in program.plan.steps:
@@ -473,22 +901,84 @@ class ProgramOrchestrator(Generic[T]):
                     context,
                     compiled.parameter_metadata,
                 )
-                if compiled.parameter_metadata.parameters:
-                    return executor.bind_parameters(
-                        compiled.circuit,
-                        bindings,
-                        compiled.parameter_metadata,
-                    )
-                return compiled.circuit
+                return CircuitInvocation(
+                    compiled.circuit,
+                    bindings,
+                    compiled.parameter_metadata,
+                )
 
         raise ExecutionError("No quantum circuit to execute")
+
+    def _prepare_expval_requests(
+        self,
+        invocation: CircuitInvocation[T],
+        accuracy: EstimationAccuracy | None,
+    ) -> tuple[EstimateRequest[T], ...]:
+        """Build ordered expectation requests from the execution plan.
+
+        Args:
+            invocation (CircuitInvocation[T]): State-preparation invocation.
+            accuracy (EstimationAccuracy | None): Optional accuracy policy.
+
+        Returns:
+            tuple[EstimateRequest[T], ...]: Requests in plan order.
+
+        Raises:
+            ExecutionError: If the plan contains no expectation steps.
+        """
+        plan = self._program.plan
+        if plan is None:
+            raise ExecutionError("No expectation execution plan")
+        requests = []
+        for step in plan.steps:
+            if not isinstance(step, ExpvalStep):
+                continue
+            compiled = self._get_compiled_expval(step.segment)
+            hamiltonian = self._prepare_expval_hamiltonian(
+                compiled,
+                invocation.circuit,
+            )
+            requests.append(EstimateRequest(invocation, hamiltonian, accuracy))
+        if not requests:
+            raise ExecutionError("No expectation value computation found")
+        return tuple(requests)
+
+    @staticmethod
+    def _prepare_expval_hamiltonian(
+        expval_segment: CompiledExpvalSegment,
+        circuit: T,
+    ) -> Any:
+        """Remap and pad one Hamiltonian for an engine circuit.
+
+        Args:
+            expval_segment (CompiledExpvalSegment): Compiled observable and
+                logical-to-physical qubit mapping.
+            circuit (T): Engine circuit whose width constrains the observable.
+
+        Returns:
+            Any: Remapped Hamiltonian safe to pass to the executor.
+        """
+        hamiltonian = expval_segment.hamiltonian
+        if expval_segment.qubit_map:
+            hamiltonian = hamiltonian.remap_qubits(expval_segment.qubit_map)
+        circuit_num_qubits = getattr(circuit, "num_qubits", None)
+        if circuit_num_qubits is None:
+            circuit_num_qubits = getattr(circuit, "qubit_count", None)
+        if (
+            circuit_num_qubits is not None
+            and hamiltonian.num_qubits < circuit_num_qubits
+        ):
+            if hamiltonian is expval_segment.hamiltonian:
+                hamiltonian = hamiltonian.copy()
+            hamiltonian._num_qubits = circuit_num_qubits
+        return hamiltonian
 
     @staticmethod
     def _resolve_quantum_bindings(
         context: ExecutionContext,
         parameter_metadata: ParameterMetadata,
     ) -> dict[str, Any]:
-        """Resolve backend parameter bindings from the current execution context.
+        """Resolve engine parameter bindings from the current execution context.
 
         Args:
             context (ExecutionContext): Execution context seeded with
@@ -497,11 +987,11 @@ class ProgramOrchestrator(Generic[T]):
                 circuit's parameter manifest.
 
         Returns:
-            dict[str, Any]: Mapping from backend parameter name to its
+            dict[str, Any]: Mapping from engine parameter name to its
                 scalar value for this execution.
 
         Raises:
-            ValueError: If any backend parameter has no value in the
+            ValueError: If any engine parameter has no value in the
                 context.
         """
         bindings: dict[str, Any] = {}
@@ -521,10 +1011,10 @@ class ProgramOrchestrator(Generic[T]):
                     candidate = context.get(key)
                     # A raw dict is the whole Dict-parameter binding (the
                     # context holds it under the bare dict name); a scalar
-                    # backend parameter must never bind to it. Skip so a
+                    # engine parameter must never bind to it. Skip so a
                     # genuinely missing per-key entry surfaces as a
                     # missing-binding error instead of a dict-typed angle.
-                    if isinstance(candidate, dict):
+                    if isinstance(candidate, (dict, list, tuple, np.ndarray)):
                         continue
                     bindings[param.name] = candidate
                     value_found = True
@@ -549,8 +1039,25 @@ class ProgramOrchestrator(Generic[T]):
         context: ExecutionContext,
         executor: QuantumExecutor[T],
         circuit: T,
+        expval_values: Iterator[float] | None = None,
     ) -> Any:
-        """Execute all program steps after the single quantum step."""
+        """Execute host post-processing after the single quantum step.
+
+        Args:
+            context (ExecutionContext): Runtime context to update.
+            executor (QuantumExecutor[T]): Engine execution adapter used by
+                the synchronous compatibility path.
+            circuit (T): Bound or parameterized state-preparation circuit.
+            expval_values (Iterator[float] | None): Pre-submitted expectation
+                values in plan order. ``None`` uses synchronous estimation.
+
+        Returns:
+            Any: Final output, last expectation value, or ``None``.
+
+        Raises:
+            ExecutionError: If fewer pre-submitted expectation values are
+                supplied than the plan requires.
+        """
         program = self._program
 
         if program.plan is None:
@@ -573,37 +1080,19 @@ class ProgramOrchestrator(Generic[T]):
                 context.update(segment_results)
             elif isinstance(step, ExpvalStep):
                 expval_seg = self._get_compiled_expval(step.segment)
-
-                hamiltonian = expval_seg.hamiltonian
-                if expval_seg.qubit_map:
-                    hamiltonian = hamiltonian.remap_qubits(expval_seg.qubit_map)
-
-                # Pad ``_num_qubits`` to the circuit's width so the
-                # backend's observable-to-SparsePauliOp conversion emits
-                # a Pauli string of the same length as the circuit's
-                # qubit count. Without this, expval over a subset of
-                # qubits (``expval(q[1::2], Z(0))``) produces a 1- or
-                # 2-qubit observable and the backend estimator rejects
-                # it with a "circuit (N) vs observable (k)" mismatch.
-                #
-                # Critically, we must NOT mutate the user's binding.
-                # ``remap_qubits`` returns ``self`` when the qubit_map
-                # is empty (identity expval on the full register) — a
-                # direct ``hamiltonian._num_qubits = ...`` would then
-                # poison the user's binding and break reuse of the
-                # same observable on a differently-sized circuit
-                # (P1-1 regression).  Clone when the remap was a
-                # no-op, then pad the copy.
-                circuit_num_qubits = getattr(circuit, "num_qubits", None)
-                if (
-                    circuit_num_qubits is not None
-                    and hamiltonian.num_qubits < circuit_num_qubits
-                ):
-                    if hamiltonian is expval_seg.hamiltonian:
-                        hamiltonian = hamiltonian.copy()
-                    hamiltonian._num_qubits = circuit_num_qubits
-
-                exp_val = executor.estimate(circuit, hamiltonian)
+                if expval_values is None:
+                    hamiltonian = self._prepare_expval_hamiltonian(
+                        expval_seg,
+                        circuit,
+                    )
+                    exp_val = executor.estimate(circuit, hamiltonian)
+                else:
+                    try:
+                        exp_val = next(expval_values)
+                    except StopIteration as error:
+                        raise ExecutionError(
+                            "Missing pre-submitted expectation result"
+                        ) from error
                 context.set(expval_seg.result_ref, exp_val)
                 result_value = exp_val
 

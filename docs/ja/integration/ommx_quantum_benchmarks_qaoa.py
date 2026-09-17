@@ -25,7 +25,7 @@
 
 # %%
 # 本チュートリアルで追加で必要なパッケージのインストール
-# # !pip install qamomile ommx-quantum-benchmarks ommx-pyscipopt-adapter
+# # !pip install "qamomile[qiskit]" ommx-quantum-benchmarks ommx-pyscipopt-adapter
 
 # %%
 import os
@@ -264,7 +264,7 @@ executor = QiskitExecutor(
 )
 
 docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-maxiter = 5 if docs_test_mode else 50
+maxiter = 1 if docs_test_mode else 50
 
 rng = np.random.default_rng(SEED)
 initial_params = rng.uniform(0, np.pi, 2 * p)
@@ -335,7 +335,7 @@ def evaluate_with_ommx(
 
 gammas_opt = list(res.x[:p])
 betas_opt = list(res.x[p:])
-final_shots = 256 if docs_test_mode else 4096
+final_shots = 1 if docs_test_mode else 4096
 
 final_result = sampling_executable.sample(
     executor,

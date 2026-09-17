@@ -21,10 +21,8 @@ from qamomile.qiskit.transpiler import QiskitTranspiler
 
 
 def _pad_to(num_qubits: int, term: qm_o.Hamiltonian) -> qm_o.Hamiltonian:
-    """Pad a Hamiltonian with a zero-coefficient identity on the highest
-    qubit so it declares the full register width. ``pauli_evolve`` expects
-    ``Hamiltonian.num_qubits`` to equal the qubit register size."""
-    padded = term + 0.0 * qm_o.Z(num_qubits - 1)
+    """Pad a Hamiltonian to the register's declared width."""
+    padded = term + qm_o.Hamiltonian.zero(num_qubits=num_qubits)
     assert padded.num_qubits == num_qubits
     return padded
 
@@ -176,13 +174,13 @@ class TestTrotterViaVectorObservable:
         assert errors[-1] < 1e-2
 
 
-class TestTrotterBackendPortability:
-    """Vector[Observable] + pauli_evolve must transpile on every backend.
+class TestTrotterEnginePortability:
+    """Vector[Observable] + pauli_evolve must transpile on every engine.
 
-    We only check that each backend produces a non-empty program with the
+    We only check that each engine produces a non-empty program with the
     expected number of per-term quantum operations; the numerical check is
     already covered on Qiskit above. These tests skip when the optional
-    backend package is not installed.
+    engine package is not installed.
     """
 
     def _build_kernel(self):

@@ -1,11 +1,12 @@
 # ---
 # jupyter:
 #   jupytext:
+#     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.18.1
+#       jupytext_version: 1.19.1
 #   kernelspec:
 #     display_name: Python 3
 #     language: python
@@ -20,14 +21,14 @@
 # # Qiskit Support
 #
 # This page shows how to use Qamomile's [Qiskit](https://quantum-computing.ibm.com/docs/) quantum SDK integration through a concrete optimization problem.
-# Qiskit is Qamomile's default quantum SDK integration. Installing `qamomile` gives you access to `QiskitTranspiler` and `QiskitExecutor`.
+# Qiskit support is optional. Install the `qiskit` extra to use `QiskitTranspiler` and `QiskitExecutor`.
 # In this tutorial, we use QAOA optimization for a small MaxCut instance as an example. We transpile a Qamomile qkernel to a Qiskit circuit, then run sampling and expectation-value evaluation on a Qiskit simulator.
-# Along the way, we also look at several advanced Qiskit features.
+# Along the way, we also look at advanced Qiskit features and IBM Quantum execution with the same `QiskitExecutor` API.
 
 # %%
 # Install the latest Qamomile through pip.
-# Qiskit and qiskit-aer are core dependencies, so no extra group is needed.
-# # !pip install qamomile
+# Install the Qiskit engine and circuit-visualization dependencies used below.
+# # !pip install "qamomile[qiskit,visualization]"
 
 # %%
 import os
@@ -153,7 +154,8 @@ def qaoa_ansatz(
 # Meanwhile, `gammas` / `betas` are left as parameters whose values are supplied later.
 
 # %%
-p = 3  # number of QAOA layers
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+p = 1 if docs_test_mode else 3  # number of QAOA layers
 qaoa_ansatz.draw(
     p=p,
     quad=spin_model.quad,
@@ -234,9 +236,8 @@ rng = np.random.default_rng(SEED)
 init_params = rng.uniform(-np.pi / 2, np.pi / 2, 2 * p)
 init_gammas = list(init_params[:p])
 init_betas = list(init_params[p:])
-docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-sample_shots = 256 if docs_test_mode else 2000
-maxiter = 20 if docs_test_mode else 100
+sample_shots = 1 if docs_test_mode else 2000
+maxiter = 4 if docs_test_mode else 100
 
 # Sample the parameterized executable and decode bitstrings to Ising energies.
 executor = transpiler.executor(backend=make_seeded_backend())
@@ -363,14 +364,14 @@ assert np.isfinite(energy_via_run)
 # %% [markdown]
 # `ExecutableProgram.run(...)` is the recommended route when you work through the Qamomile API.
 # Direct `executor.estimate(...)` calls are still available when you intentionally manage Qiskit circuits yourself, but then you are responsible for Qiskit's parameter ordering and whether the circuit has already been bound.
-# `QiskitExecutor` creates Qiskit's `StatevectorEstimator` by default when it is available, so current Qiskit installs use the V2 primitive interface.
+# For local execution, `QiskitExecutor` creates Qiskit's `StatevectorEstimator` by default when it is available, so current Qiskit installs use the V2 primitive interface.
 # If a custom estimator, or an older Qiskit / Aer estimator, does not accept the V2 `run([(circuit, observable, params)])` call, Qamomile falls back to the V1 `run(circuits, observables, parameter_values)` form.
 
 # %% [markdown]
 # ## Advanced Qiskit features
 #
-# Qiskit is Qamomile's default quantum SDK integration.
-# For that reason, Qamomile provides several ways to use advanced Qiskit features.
+# Qiskit is available through Qamomile's optional Qiskit integration.
+# Qamomile provides several ways to use advanced Qiskit features.
 #
 # This section shows three features exposed by the Qiskit integration that are useful when running generated circuits on Qiskit execution targets:
 #
@@ -451,14 +452,14 @@ print("if_else condition:", if_op.condition)
 
 # %% [markdown]
 # Qiskit's classical expression system currently covers the logical, comparison, and arithmetic operations that Qamomile uses in dynamic conditions.
-# However, `FLOORDIV` and `POW` do not have matching Qiskit classical expressions, so Qamomile raises `NotImplementedError` during circuit generation if either one remains in a runtime condition.
+# However, `FLOORDIV` and `POW` do not have matching Qiskit classical expressions, so target-legality verification raises `TargetCapabilityError` before Qiskit circuit construction if either one remains in a runtime condition.
 # If you need those operations, make sure their values are fixed before transpilation.
 
 # %% [markdown]
 # ### Native `PauliEvolutionGate`
 #
 # `qmc.pauli_evolve(q, H, gamma)` represents the time evolution $e^{-i\gamma H}$.
-# The Qiskit integration writes that operation as a `PauliEvolutionGate` when `use_native_composite=True` (the default).
+# The Qiskit integration writes that operation as a `PauliEvolutionGate` when `use_native_pauli_evolution=True` (the default).
 # An unbound `gamma` becomes a Qiskit `Parameter`, so the same circuit can be reused while trying different variational parameters.
 
 # %%
@@ -492,15 +493,15 @@ assert "PauliEvolution" in evolution_ops
 assert {str(param) for param in evolution_circuit.parameters} == {"gamma"}
 
 # %% [markdown]
-# Pass `QiskitTranspiler(use_native_composite=False)` when you want a gate-by-gate decomposition instead.
-# The same flag also disables native QFT/IQFT output, which is useful for debugging or for comparing gate counts across quantum SDKs.
+# Pass `QiskitTranspiler(use_native_pauli_evolution=False)` when you want a gate-by-gate decomposition instead.
+# This flag controls only Pauli evolution. Native QFT/IQFT output is controlled independently by `use_native_composite`.
 
 # %% [markdown]
 # ### Native `QFTGate`
 #
 # Qamomile provides high-level operations for QFT and inverse QFT through `qmc.qft(...)` / `qmc.iqft(...)`.
 # The Qiskit integration can translate these qkernels directly to Qiskit's native `QFTGate`, without decomposing them into elementary quantum gates.
-# If you need a decomposed circuit, pass `use_native_composite=False` to expand the operation into H/controlled-phase/SWAP gates.
+# With `use_native_composite=False`, Qamomile keeps a named Qiskit gate backed by the portable fallback body. Call Qiskit's `decompose()` when you need to inspect its H/controlled-phase/SWAP implementation.
 
 # %%
 # Compare Qiskit's native QFT gate with a decomposed circuit.
@@ -520,19 +521,21 @@ qft_decomposed = QiskitTranspiler(use_native_composite=False).to_circuit(
     bindings={"n": 3},
 )
 native_ops = [inst.operation.name for inst in qft_native.data]
-decomposed_ops = [inst.operation.name for inst in qft_decomposed.data]
+decomposed_ops = [
+    inst.operation.name for inst in qft_decomposed.decompose(reps=1).data
+]
 print("native QFT ops    :", native_ops)
 print("decomposed QFT ops:", decomposed_ops)
 assert any("qft" in name.lower() for name in native_ops)
 assert "cp" in decomposed_ops
-assert len(qft_native.data) < len(qft_decomposed.data)
+assert len(qft_native.data) < len(decomposed_ops)
 
 # %% [markdown]
 # ## Using other Qiskit execution targets
 #
 # `QiskitExecutor` keeps the generated circuit separate from the Qiskit execution target that runs it.
 # By passing an execution target with `transpiler.executor(backend=...)`, you can run the same circuit on various Qiskit execution targets.
-# For example, you can use a noiseless local simulator, an Aer noise model, or a real quantum computer provided by IBM Quantum.
+# For example, you can use a noiseless local simulator, an Aer noise model, or IBM Quantum hardware through the same `QiskitExecutor` as shown below.
 #
 # Here, we build an Aer noise model with depolarizing noise and pass it to `AerSimulator`.
 # We compare the clean and noisy sample-mean energies at the same optimized parameters.
@@ -575,12 +578,90 @@ assert np.isfinite(clean_energy)
 assert np.isfinite(noisy_energy)
 
 # %% [markdown]
+# ## Running on IBM Quantum hardware
+#
+# Install Qiskit support with `pip install "qamomile[qiskit]"`; this extra includes Qiskit IBM Runtime for hardware execution. Then pass a device name, IBM Quantum API key, and instance CRN to `transpiler.executor(...)`.
+# It returns the same `QiskitExecutor` used for local simulation. With no arguments it uses local Aer; with an IBM device name it authenticates through Qiskit IBM Runtime and selects that backend for `executable.sample()` and `executable.run()`.
+# The following examples submit remote jobs when run manually; they are not executed as part of this notebook.
+#
+# ```python
+# import os
+#
+# from qamomile.qiskit import QiskitExecutionOptions
+#
+# hardware_options = QiskitExecutionOptions(
+#     max_execution_time=300,
+#     resilience_level=1,
+# )
+# hardware_executor = transpiler.executor(
+#     backend="your_backend_name",
+#     api_key=os.environ["IBM_QUANTUM_API_KEY"],
+#     instance_crn=os.environ["IBM_QUANTUM_INSTANCE_CRN"],
+#     options=hardware_options,
+# )
+# runtime_bindings = {"gammas": opt_gammas, "betas": opt_betas}
+#
+# hardware_job = executable.sample(
+#     hardware_executor,
+#     bindings=runtime_bindings,
+#     shots=1024,
+# )
+# print(hardware_job.status())
+# snapshot_data = hardware_job.snapshot().to_dict()
+# hardware_result = hardware_job.result()
+# ```
+#
+# Set the two environment variables to your API key and instance CRN before running this example. You can also construct `QiskitExecutor(backend=..., api_key=..., instance_crn=..., options=hardware_options)` directly with the same arguments.
+# `QiskitExecutionOptions` configures Runtime through Qamomile, without importing SDK option classes. `max_execution_time` limits quantum execution time in seconds for both sampling and estimation; queue wait time and the local `.result(timeout=...)` wait are separate. `resilience_level` (0, 1, or 2) applies to expectation estimation. These settings require a Runtime target.
+# Qamomile passes the credentials to `QiskitRuntimeService` using the `ibm_quantum_platform` channel and requests the named backend within that instance. If that account and instance cannot access the backend, Qiskit's error is raised while constructing the executor; execution does not switch to another device or a simulator.
+# Both `api_key` and `instance_crn` must be nonempty strings supplied together with a backend name; incomplete credentials raise `ValueError`. The executor does not save the credentials to disk.
+# If you already configured a saved account with Qiskit IBM Runtime, omit both credentials and use `transpiler.executor(backend="your_backend_name")`.
+#
+# With an IBM backend, `QiskitExecutor` binds the runtime parameters and transpiles the circuit to the selected backend's instruction set before submission to Runtime V2 primitives.
+# For expectation values, it also maps the observable to the transpiled circuit's physical qubit layout, so changing the hardware layout preserves the intended observable.
+#
+# Sampling and expectation jobs expose `status()`, `cancel()`, and `snapshot()` while `.result()` waits for the result.
+# Store `snapshot_data` as JSON to reconnect later. Recreate the same executable and an executor for the original backend, then restore the typed result with the original runtime bindings:
+#
+# ```python
+# from qamomile.circuit.transpiler.job import JobSnapshot
+#
+# restored_job = executable.restore(
+#     hardware_executor,
+#     JobSnapshot.from_dict(snapshot_data),
+#     bindings=runtime_bindings,
+# )
+# restored_result = restored_job.result()
+# ```
+#
+# Snapshots contain provider job identifiers, completed local values, and result metadata; credentials and runtime bindings remain caller-owned.
+# Deterministic local results, such as constant observables and empty circuits, can be saved and restored, including in groups that also contain remote jobs.
+# Restoring provider references uses the Runtime service created when the executor authenticates. If you already manage a `QiskitRuntimeService`, pass `service=service` with the backend name instead of `api_key` and `instance_crn`, or pass its `IBMBackend` object as `backend`.
+#
+# The expectation executable from above also works with Runtime. Use `TargetPrecision` to request an absolute target precision for one evaluation:
+#
+# ```python
+# from qamomile.circuit.transpiler.execution_request import TargetPrecision
+#
+# energy_job = expval_executable.run(
+#     hardware_executor,
+#     bindings=runtime_bindings,
+#     estimation=TargetPrecision(0.05),
+# )
+# hardware_energy = energy_job.result()
+# ```
+#
+# Sampling `shots` and estimation `TargetPrecision` are still specified per execution call. Omitting `TargetPrecision` uses the Runtime estimator's configured defaults.
+# For additional Runtime settings, pass dictionaries as `sampler_options` and `estimator_options` when constructing `QiskitExecutionOptions`. You can also pass native options directly through the executor's `sampler_options=...` and `estimator_options=...` arguments, but these cannot be combined with `options=...`. Supply a backend-specific `pass_manager=...` to control hardware transpilation.
+# To use an existing Runtime `Session` or `Batch`, pass it as `mode=...` with its preconfigured backend object as `backend=...`; a backend name cannot be combined with `mode`. The caller manages its context and lifetime; the executor does not create or close it.
+#
+# %% [markdown]
 # ## Summary
 #
 # - `QiskitTranspiler().transpile(kernel, bindings=..., parameters=[...])` converts the qkernel to an `ExecutableProgram[QuantumCircuit]`; `to_circuit(...)` returns the Qiskit `QuantumCircuit` directly when you want to stay inside the Qiskit ecosystem.
-# - `QiskitExecutor` supports both `executable.sample()` for measured qkernels and `executable.run()` / `executor.estimate(...)` for expectation values, using `AerSimulator` by default and accepting any Qiskit execution target object through `transpiler.executor(backend=...)`.
+# - `QiskitExecutor` supports both `executable.sample()` for measured qkernels and `executable.run()` / `executor.estimate(...)` for expectation values, using `AerSimulator` by default. Pass an IBM backend name with `api_key` and `instance_crn`, or an existing `IBMBackend`, to use Runtime V2 with the same API.
 # - The Qiskit integration uses native mid-circuit measurement, dynamic `for_loop` / `if_else` / `while_loop`, runtime classical expressions, `PauliEvolutionGate`, and `QFTGate` where Qiskit provides a high-level representation.
-# - Aer noise models, provider execution targets, and qBraid-wrapped Qiskit devices can be used without re-transpiling the qkernel; Qamomile's optimization helpers use the same Qiskit circuit interface.
+# - Switching from Aer to IBM Quantum reuses the Qamomile executable; `QiskitExecutor` handles hardware transpilation, observable layout, and asynchronous job restoration.
 
 # %% [markdown]
 # ### See also

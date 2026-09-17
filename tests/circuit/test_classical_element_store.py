@@ -30,7 +30,7 @@ pytest.importorskip("qiskit")
 
 from qamomile.qiskit import QiskitTranspiler  # noqa: E402
 
-Backend = tuple[str, Any, Any]
+Engine = tuple[str, Any, Any]
 
 
 @pytest.fixture(
@@ -40,8 +40,8 @@ Backend = tuple[str, Any, Any]
         pytest.param("cudaq", marks=pytest.mark.cudaq),
     ]
 )
-def backend(request) -> Backend:
-    """Yield ``(name, transpiler, executor)`` for each installed SDK backend."""
+def engine(request) -> Engine:
+    """Yield ``(name, transpiler, executor)`` for each installed SDK engine."""
     name = request.param
     if name == "qiskit":
         from qamomile.qiskit import QiskitTranspiler
@@ -61,7 +61,7 @@ def backend(request) -> Backend:
 
         transpiler = CudaqTranspiler()
         return name, transpiler, transpiler.executor()
-    raise AssertionError(f"unknown backend {name}")
+    raise AssertionError(f"unknown engine {name}")
 
 
 def _counts(result: Any) -> dict[Any, int]:
@@ -90,12 +90,12 @@ def copy_bit_kernel() -> qmc.Vector[qmc.Bit]:
     return bits
 
 
-def test_measured_bit_store_repro(backend):
+def test_measured_bit_store_repro(engine):
     """The original silent-drop repro: bits[1] = bits[0] must yield (1, 1).
 
     Before the fix the write was dropped and sampling returned (1, 0).
     """
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     exe = transpiler.transpile(copy_bit_kernel)
     counts = _counts(exe.sample(executor, shots=100).result())
     assert counts == {(1, 1): 100}, f"{name}: got {counts}"
@@ -111,9 +111,9 @@ def chained_bit_kernel() -> qmc.Vector[qmc.Bit]:
     return bits
 
 
-def test_measured_bit_chained_stores(backend):
+def test_measured_bit_chained_stores(engine):
     """Chained stores read the post-store contents of the previous store."""
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     exe = transpiler.transpile(chained_bit_kernel)
     counts = _counts(exe.sample(executor, shots=100).result())
     assert counts == {(1, 1, 1): 100}, f"{name}: got {counts}"
@@ -127,9 +127,9 @@ def bit_literal_kernel() -> qmc.Vector[qmc.Bit]:
     return bits
 
 
-def test_measured_bit_literal_store(backend):
+def test_measured_bit_literal_store(engine):
     """A Python literal 0/1 can be stored into a measured Vector[Bit]."""
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     exe = transpiler.transpile(bit_literal_kernel)
     counts = _counts(exe.sample(executor, shots=100).result())
     assert counts == {(0, 1): 100}, f"{name}: got {counts}"
@@ -148,9 +148,9 @@ def two_register_kernel() -> tuple[qmc.Vector[qmc.Bit], qmc.Vector[qmc.Bit]]:
     return dst, bits
 
 
-def test_measured_bit_loop_store_between_registers(backend):
+def test_measured_bit_loop_store_between_registers(engine):
     """A loop-indexed store copies one register's readout into another's."""
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     exe = transpiler.transpile(two_register_kernel)
     counts = _counts(exe.sample(executor, shots=100).result())
     assert counts == {((1, 1), (1, 1)): 100}, f"{name}: got {counts}"
@@ -265,9 +265,9 @@ def test_compile_time_if_store_folds_into_gate_angle():
     np.testing.assert_allclose(emitted, [float(np.pi)], atol=1e-12)
 
 
-def test_stored_pi_angle_flips_qubit(backend):
+def test_stored_pi_angle_flips_qubit(engine):
     """End-to-end: rx(pi) through a stored element flips the qubit."""
-    name, transpiler, executor = backend
+    name, transpiler, executor = engine
     exe = transpiler.transpile(
         angle_store_kernel, bindings={"vals": [float(np.pi), 0.0]}
     )
@@ -688,26 +688,22 @@ def test_store_op_shape_in_ir():
 
 
 def test_store_op_serialize_roundtrip():
-    """A block containing a store op round-trips through JSON and msgpack."""
-    from qamomile.circuit.ir import serialize
+    """A qkernel containing a store op round-trips through protobuf."""
+    from qamomile.circuit.serialization import deserialize, serialize
 
     transpiler = QiskitTranspiler()
     block = transpiler.inline(transpiler.to_block(copy_bit_kernel))
 
-    for dump, load in (
-        (serialize.dump_json, serialize.load_json),
-        (serialize.dump_msgpack, serialize.load_msgpack),
-    ):
-        restored = load(dump(block))
-        restored_ops = [type(op).__name__ for op in restored.operations]
-        assert restored_ops == [type(op).__name__ for op in block.operations]
-        restored_store = next(
-            op
-            for op in restored.operations
-            if isinstance(op, StoreArrayElementOperation)
-        )
-        assert len(restored_store.operands) == 3
-        assert restored_store.results[0].uuid == block.output_values[0].uuid
+    restored = transpiler.inline(deserialize(serialize(copy_bit_kernel)).block)
+    restored_ops = [type(op).__name__ for op in restored.operations]
+    assert restored_ops == [type(op).__name__ for op in block.operations]
+    restored_store = next(
+        op for op in restored.operations if isinstance(op, StoreArrayElementOperation)
+    )
+    assert len(restored_store.operands) == 3
+    assert restored_store.results[0].uuid == restored.output_values[0].uuid
+    assert restored_store.results[0].logical_id == restored_store.array.logical_id
+    assert restored_store.results[0].version == restored_store.array.version + 1
 
 
 def test_store_op_canonicalize_stable():
