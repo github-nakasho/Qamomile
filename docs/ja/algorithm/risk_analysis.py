@@ -23,7 +23,7 @@
 # Value at Risk (VaR) や Conditional Value at Risk (CVaR) の計算は、金融リスクを定量化する上でとても重要です。
 # この計算には古典モンテカルロシミュレーション手法が用いられてきましたが、計算量が膨大なものとなる問題がありました。
 # その計算量を緩和し、より高速な計算を可能にする技術として、量子コンピュータによる手法が考案されています。
-# そこで本記事では、VaR および CVaR を量子コンピュータ乗で効率的に計算するアルゴリズムを提案した [Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) を題材に、Qamomileによる実装の一例をまとめました。
+# そこで本記事では、VaR および CVaR を量子コンピュータ上で効率的に計算するアルゴリズムを提案した [Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) を題材に、Qamomileによる実装の一例をまとめました。
 
 # %%
 # Install the latest Qamomile through pip! 
@@ -205,7 +205,7 @@ from scipy.stats import norm
 # $$
 #
 # のようになります。
-# QAE でこの $\mathbb{E} [f(X)]$ を推定し、その後で $\ell_\alpha$ をかけることで、CVaRを求めることができます。
+# QAE でこの $\mathbb{E} [f(X)]$ を推定し、その後で $\ell_\alpha / P[X \leq \ell_\alpha]$ をかけることで、CVaRを求めることができます。
 
 # %% [markdown]
 # ## Qamomileによる実装
@@ -827,7 +827,7 @@ def estimate_amplitude_qae(
 # %% [markdown]
 # ### VaRとCVaRの計算
 #
-# QAEによる $P[X \leq \ell]$ の推定と、二部探索を組合せることで、$\mathrm{VaR}_\alpha$ を求めましょう。
+# QAEによる $P[X \leq \ell]$ の推定と、二分探索を組合せることで、$\mathrm{VaR}_\alpha$ を求めましょう。
 # 各ステップで中間点 $\ell_\mathrm{mid}$ の累積確率を QAE で推定し、$1-\alpha$ との大小比較から探索範囲を縮小していきます。
 # CVaR 計算では、その VaR 以下の領域に $u = 0$ の $F$ を適用し、 さらに QAE を用います。
 
@@ -892,8 +892,73 @@ def compute_var(
 
 
 # ===================================================
-# Step 5: CVaR の計算
+# Step 5: CVaR の計算と成立性チェック
 # ===================================================
+
+def validate_cvar_estimate(
+    truncated_normalized_mean: float,
+    conditional_mean_index: float,
+    cvar_x: float,
+    prob_var: float,
+    var_alpha_index: int,
+    var_alpha_x: float,
+    x_min: float,
+    atol: float = 1e-9,
+) -> tuple[bool, list[str]]:
+    """復元した下側 CVaR が数学的な必要条件を満たすか確認する。"""
+    reasons: list[str] = []
+
+    values = [
+        truncated_normalized_mean,
+        conditional_mean_index,
+        cvar_x,
+        prob_var,
+    ]
+    if not all(np.isfinite(v) for v in values):
+        reasons.append("non-finite value detected")
+        return False, reasons
+
+    # tail 内では 0 <= i/l <= 1 なので、
+    # E[(i/l) 1[i<=l]] は [0, P(i<=l)] に入る必要がある。
+    if not (-atol <= truncated_normalized_mean <= prob_var + atol):
+        reasons.append("truncated normalized mean is outside [0, P(tail)]")
+
+    # 条件付き平均 index は tail の index 範囲 [0, l_alpha] 内にある必要がある。
+    if not (-atol <= conditional_mean_index <= var_alpha_index + atol):
+        reasons.append(
+            f"conditional mean index is outside [0, {var_alpha_index}]"
+        )
+
+    # 下側 CVaR は最小値以上かつ VaR 以下でなければならない。
+    if not (x_min - atol <= cvar_x <= var_alpha_x + atol):
+        reasons.append(
+            "lower-tail CVaR is outside "
+            f"[{x_min:.6f}, VaR={var_alpha_x:.6f}]"
+        )
+
+    return len(reasons) == 0, reasons
+
+
+def classical_cvar_at_index(
+    var_idx: int,
+    amplitudes: np.ndarray,
+    mu: float,
+    sigma: float,
+) -> float:
+    """同じ離散分布・同じ VaR index に対する古典的 CVaR を計算する。"""
+    probs = np.asarray(amplitudes, dtype=float) ** 2
+    N = len(probs)
+    x_vals = np.linspace(mu - 3 * sigma, mu + 3 * sigma, N)
+
+    tail_probability = float(np.sum(probs[: var_idx + 1]))
+    if tail_probability <= 0.0:
+        return float("nan")
+
+    return float(
+        np.dot(x_vals[: var_idx + 1], probs[: var_idx + 1])
+        / tail_probability
+    )
+
 
 def compute_cvar(
     alpha: float,
@@ -907,15 +972,20 @@ def compute_cvar(
     sigma: float,
     shots: int = 4096,
 ) -> float:
-    """Woerner--Egger の u=0 efficient F を用いて下側 CVaR を推定する。"""
-    del alpha, var_alpha_x  # 定義を明示するため引数として残す
+    """Woerner--Egger の u=0 efficient F を用いて下側 CVaR を推定する。
+
+    復元された条件付き平均が tail 領域の数学的制約を破る場合は、
+    有限 m の QAE 精度が不足しているとみなし np.nan を返す。
+    """
+    del alpha  # 関数の意味を明示するため引数として残す
 
     N = 2 ** n
     x_vals = np.linspace(mu - 3 * sigma, mu + 3 * sigma, N)
     x_min = x_vals[0]
     dx = x_vals[1] - x_vals[0]
 
-    if prob_var <= 0.0:
+    if prob_var <= 0.0 or not np.isfinite(prob_var):
+        print("  [CVaR invalid] P[X<=VaR] is non-positive or non-finite.")
         return float("nan")
 
     # l_alpha = 0 の場合、選択領域の index は 0 のみ。
@@ -927,6 +997,10 @@ def compute_cvar(
     amplitude = estimate_amplitude_qae(
         n, m, amplitudes, objective, shots=shots
     )
+
+    if not np.isfinite(amplitude):
+        print("  [CVaR invalid] QAE amplitude is not finite.")
+        return float("nan")
 
     # u=0:
     # amplitude ~= c * E[(i/l) 1[i<=l]] + (1-c)/2 * P[i<=l]
@@ -943,6 +1017,25 @@ def compute_cvar(
         f"  CVaR efficient F: c={c:.4f}, QAE amplitude~{amplitude:.4f}, "
         f"E[index | tail]~{conditional_mean_index:.4f}"
     )
+
+    cvar_valid, reasons = validate_cvar_estimate(
+        truncated_normalized_mean=truncated_normalized_mean,
+        conditional_mean_index=conditional_mean_index,
+        cvar_x=cvar_x,
+        prob_var=prob_var,
+        var_alpha_index=var_alpha_index,
+        var_alpha_x=var_alpha_x,
+        x_min=x_min,
+    )
+
+    if not cvar_valid:
+        print("  [CVaR invalid] finite-m QAE precision is insufficient.")
+        for reason in reasons:
+            print(f"    - {reason}")
+        print(f"    raw CVaR estimate = {cvar_x:.4f}")
+        print("    -> This CVaR estimate will be discarded.")
+        return float("nan")
+
     return float(cvar_x)
 
 
@@ -972,32 +1065,11 @@ def plot_results_vs_m(
     probs = norm.pdf(x_vals, mu, sigma)
     probs /= probs.sum()
 
-    z = norm.ppf(tail_prob)
     theory_var = norm.ppf(tail_prob, mu, sigma)
-    theory_cvar = mu - sigma * norm.pdf(z) / tail_prob
-
-    def classical_cvar(var_idx):
-        prob_var_true = sum(probs[i] for i in range(var_idx + 1))
-        if prob_var_true == 0:
-            return 0.0
-        return (
-            sum(x_vals[i] * probs[i] for i in range(var_idx + 1))
-            / prob_var_true
-        )
 
     n_cols = len(m_list)
-    fig = plt.figure(figsize=(4 * n_cols, 10))
-    gs = plt.GridSpec(
-        2,
-        n_cols,
-        hspace=0.5,
-        wspace=0.35,
-        height_ratios=[2, 1],
-    )
-
-    var_estimates = []
-    cvar_estimates = []
-    cvar_classical = []
+    fig = plt.figure(figsize=(4 * n_cols, 6))
+    gs = plt.GridSpec(1, n_cols, wspace=0.35)
 
     for col, m in enumerate(m_list):
         ax = fig.add_subplot(gs[0, col])
@@ -1006,11 +1078,8 @@ def plot_results_vs_m(
         var_idx = res["var_alpha_index"]
         var_x = res["var_alpha_x"]
         cvar_val = res["cvar_alpha"]
-        cvar_cl = classical_cvar(var_idx)
-
-        var_estimates.append(var_x)
-        cvar_estimates.append(cvar_val)
-        cvar_classical.append(cvar_cl)
+        cvar_valid = res["cvar_valid"]
+        cvar_reference = res["cvar_reference"]
 
         bar_width = (x_vals[1] - x_vals[0]) * 0.85
         ax.bar(
@@ -1028,28 +1097,62 @@ def plot_results_vs_m(
             color="#1f77b4",
             alpha=0.6,
         )
+
         ax.axvline(
             x=var_x,
             color="#D85A30",
             linestyle="--",
             linewidth=1.8,
-            label=f"VaR = {var_x:.2f}",
+            label=f"QAE VaR = {var_x:.2f}",
         )
-        ax.axvline(
-            x=cvar_val,
-            color="#7F77DD",
-            linestyle=":",
-            linewidth=1.8,
-            label=f"CVaR = {cvar_val:.2f}",
-        )
+
+        # 同じ離散分布・同じ VaR index に対する古典 CVaR を参照線として描く。
+        if np.isfinite(cvar_reference):
+            ax.axvline(
+                x=cvar_reference,
+                color="gray",
+                linestyle=":",
+                linewidth=1.2,
+                alpha=0.9,
+                label=f"Discrete CVaR = {cvar_reference:.2f}",
+            )
+
+        # 数学的成立性を満たした量子 CVaR だけを描画する。
+        if cvar_valid and np.isfinite(cvar_val):
+            ax.axvline(
+                x=cvar_val,
+                color="#7F77DD",
+                linestyle=":",
+                linewidth=1.8,
+                label=f"QAE CVaR = {cvar_val:.2f}",
+            )
+
         ax.axvline(
             x=theory_var,
             color="gray",
             linestyle="-.",
             linewidth=1.0,
             alpha=0.7,
-            label=f"Theoretical VaR = {theory_var:.2f}",
+            label=f"Continuous VaR = {theory_var:.2f}",
         )
+
+        status_lines = []
+        if res.get("qae_resolution_warning", False):
+            status_lines.append("QAE resolution: coarse")
+        if not cvar_valid:
+            status_lines.append("CVaR invalid - not plotted")
+
+        if status_lines:
+            ax.text(
+                0.98,
+                0.97,
+                "\n".join(status_lines),
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=7,
+                bbox={"boxstyle": "round", "alpha": 0.15},
+            )
 
         ax.set_title(f"$m={m}$ ($M={2**m}$)", fontsize=11)
         ax.set_xlabel("Portfolio value $X$", fontsize=9)
@@ -1062,9 +1165,92 @@ def plot_results_vs_m(
         f"Fully QAE: fixed $n={n}$ ($N={N}$), varied $m$ \n"
         f"(confidence $\\alpha={alpha}$, tail $1-\\alpha={tail_prob:.3f}$)",
         fontsize=12,
-        y=1.01,
+        y=1.02,
     )
     plt.show()
+
+
+
+# %% [markdown]
+# ### サニティチェック
+#
+# メイン実験を実行する前に、実装が最低限の数値的整合性を満たすことを assertion で確認します。
+# 振幅符号化の正規化に加え、解析的に振幅 $a=0.5$ と分かる小規模 QAE ケースを実行し、さらに CVaR validity 判定が valid / invalid の双方を正しく識別できることを検証します。
+# これにより、CVaR がすべて `NaN` となるような回帰や、成立性チェックが機能しなくなる変更を検出しやすくします。
+
+# %%
+# ===================================================
+# Numerical sanity checks
+# ===================================================
+
+def run_numerical_sanity_checks():
+    print("Running numerical sanity checks...")
+
+    # ------------------------------------------------
+    # Check 1: amplitude encoding 用の確率が正規化されている
+    # ------------------------------------------------
+    test_amplitudes = np.sqrt(np.array([0.5, 0.5], dtype=float))
+    np.testing.assert_allclose(
+        np.sum(test_amplitudes ** 2),
+        1.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+    # ------------------------------------------------
+    # Check 2: 解析的に P[X<=0] = 0.5 となる小さな QAE
+    # n=1, p(0)=p(1)=0.5, l=0。
+    # m=2 (M=4) では a=0.5 を QAE の候補として厳密に表現できる。
+    # ------------------------------------------------
+    test_objective = make_var_objective_kernel(n=1, l=0)
+    test_qae = estimate_amplitude_qae(
+        n=1,
+        m=2,
+        amplitudes=test_amplitudes,
+        objective_kernel=test_objective,
+        shots=1024,
+    )
+    np.testing.assert_allclose(
+        test_qae,
+        0.5,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+    # ------------------------------------------------
+    # Check 3: valid な CVaR 例を reject しない
+    # ------------------------------------------------
+    valid, reasons = validate_cvar_estimate(
+        truncated_normalized_mean=0.10,
+        conditional_mean_index=1.50,
+        cvar_x=-2.40,
+        prob_var=0.20,
+        var_alpha_index=3,
+        var_alpha_x=-1.80,
+        x_min=-3.00,
+    )
+    assert valid, f"A valid CVaR example was rejected: {reasons}"
+
+    # ------------------------------------------------
+    # Check 4: invalid な CVaR 例を確実に reject する
+    # E[index | tail] > l_alpha かつ CVaR > VaR を意図的に作る。
+    # ------------------------------------------------
+    invalid, reasons = validate_cvar_estimate(
+        truncated_normalized_mean=0.10,
+        conditional_mean_index=5.00,
+        cvar_x=-1.00,
+        prob_var=0.08,
+        var_alpha_index=4,
+        var_alpha_x=-1.40,
+        x_min=-3.00,
+    )
+    assert not invalid, "An invalid CVaR example was not rejected."
+    assert len(reasons) > 0
+
+    print("All numerical sanity checks passed.")
+
+
+run_numerical_sanity_checks()
 
 
 
@@ -1098,6 +1284,7 @@ print(
 print(f"mu={mu}, sigma={sigma}")
 print("=" * 60)
 
+# Continuous normal reference
 z = norm.ppf(tail_prob)
 theory_var = norm.ppf(tail_prob, mu, sigma)
 theory_cvar = mu - sigma * norm.pdf(z) / tail_prob
@@ -1106,7 +1293,17 @@ print(
     f"CVaR_{alpha:.0%}={theory_cvar:.4f}\n"
 )
 
+# Distribution preparation
 amplitudes = make_normal_amplitudes(n, mu=mu, sigma=sigma)
+
+# 本番入力についても amplitude encoding の正規化を assertion で確認する。
+np.testing.assert_allclose(
+    np.sum(amplitudes ** 2),
+    1.0,
+    rtol=0.0,
+    atol=1e-12,
+)
+
 results_by_m = {}
 
 for m in m_list:
@@ -1114,6 +1311,25 @@ for m in m_list:
     print(f"m={m} (M={2**m})")
     print(f"{'=' * 45}")
 
+    # Fully QAE が 0 より大きい振幅として表現できる最小候補。
+    # これが target tail probability より大きい場合は、5% 付近の
+    # 確率を十分細かく分解できない可能性が高いことを明示する。
+    M = 2 ** m
+    min_positive_amplitude = float(np.sin(np.pi / M) ** 2)
+    resolution_warning = min_positive_amplitude > tail_prob
+
+    if resolution_warning:
+        print(
+            "  [QAE resolution warning] "
+            f"smallest positive amplitude={min_positive_amplitude:.4f} "
+            f"> target tail probability={tail_prob:.4f}"
+        )
+        print(
+            "    -> probabilities near the target tail are "
+            "too coarsely resolved for this m."
+        )
+
+    # VaR
     var_idx, var_x, prob_var = compute_var(
         alpha,
         n,
@@ -1124,6 +1340,7 @@ for m in m_list:
         shots=shots,
     )
 
+    # CVaR
     cvar = compute_cvar(
         alpha,
         var_idx,
@@ -1136,23 +1353,80 @@ for m in m_list:
         sigma=sigma,
         shots=shots,
     )
+    cvar_valid = bool(np.isfinite(cvar))
+
+    # 同じ離散分布・同じ VaR index に対する古典 CVaR を参照値として計算する。
+    cvar_reference = classical_cvar_at_index(
+        var_idx,
+        amplitudes,
+        mu,
+        sigma,
+    )
 
     print("\n--- result ---")
     print(
         f"VaR_{alpha:.0%}  = {var_x:.4f}  "
         f"(continuous normal {theory_var:.4f})"
     )
-    print(
-        f"CVaR_{alpha:.0%} = {cvar:.4f}  "
-        f"(continuous normal {theory_cvar:.4f})"
-    )
+
+    if cvar_valid:
+        cvar_abs_error = abs(cvar - cvar_reference)
+        print(f"CVaR_{alpha:.0%} = {cvar:.4f}")
+        print(
+            f"  discrete classical reference at same VaR = "
+            f"{cvar_reference:.4f}"
+        )
+        print(f"  absolute error = {cvar_abs_error:.4f}")
+    else:
+        cvar_abs_error = float("nan")
+        print(f"CVaR_{alpha:.0%} = unavailable")
+        print(
+            "  insufficient QAE precision; invalid estimate discarded"
+        )
+        print(
+            f"  discrete classical reference at same VaR = "
+            f"{cvar_reference:.4f}"
+        )
 
     results_by_m[m] = {
         "var_alpha_index": var_idx,
         "var_alpha_x": var_x,
         "prob_var": prob_var,
         "cvar_alpha": cvar,
+        "cvar_valid": cvar_valid,
+        "cvar_reference": cvar_reference,
+        "cvar_abs_error": cvar_abs_error,
+        "qae_resolution_warning": resolution_warning,
+        "qae_min_positive_amplitude": min_positive_amplitude,
     }
+
+
+# ===================================================
+# Regression assertions for the main experiment
+# ===================================================
+
+# すべての CVaR が silently NaN になっても notebook が成功してしまう、
+# という regression を防ぐ。
+assert any(
+    result["cvar_valid"] for result in results_by_m.values()
+), (
+    "No valid CVaR estimate was obtained. "
+    "Check QAE precision and CVaR reconstruction."
+)
+
+# valid / invalid の保存規約と、下側 CVaR の必要条件を確認する。
+for m, result in results_by_m.items():
+    if result["cvar_valid"]:
+        assert np.isfinite(result["cvar_alpha"])
+        assert result["cvar_alpha"] <= result["var_alpha_x"] + 1e-9, (
+            f"m={m}: valid CVaR exceeds VaR."
+        )
+    else:
+        assert np.isnan(result["cvar_alpha"]), (
+            f"m={m}: invalid CVaR must be NaN."
+        )
+
+print("\nMain-result validation passed.")
 
 plot_results_vs_m(
     results_by_m,
@@ -1162,9 +1436,8 @@ plot_results_vs_m(
     sigma=sigma,
 )
 
-
 # %% [markdown]
-# 入力として用いた離散正規分布、そして QAE により推定した VaR および CVaR を縦線で示しています。
+# 入力として用いた離散正規分布、QAE により推定した VaR および CVaR、そして古典的に求めた Var と CVaR を縦線で表示しています。
 # オレンジ色の棒グラフは VaR 以下の下側テイル領域、青色部分は VaR を超える領域を表しています。
 # $m$ は QAE 内部の QPE で用いる位相推定レジスタの量子ビット数であり、$M=2^m$ によって位相、そして振幅推定の分解能が決まります。
 # この結果では、$m=1$ に比べて $m=3,5$ で VaR の推定値は大きく改善しています。
@@ -1172,8 +1445,21 @@ plot_results_vs_m(
 # 一方、CVaR は VaR 以下の領域に対する条件付き期待値であり、この実装では $u=0$ でのテイラー展開近似による $F$ を利用しています。  
 # そのため、CVaR の誤差には QAE の有限精度だけでなく、$F$ の近似誤差や VaR 推定誤差も含まれます。
 # 特にテイルの確率が小さい場合、条件付き期待値を復元する際に QAE の誤差が増幅されるため、今回の結果からは CVaR が $m$ とともに単調に改善していることは確認できません。
+# むしろ $m =5$ では CVaR の推定精度が悪く、$\mathrm{CVaR} \leq \mathrm{VaR}$ を満たしていないため、CVaR の縦線を表示していません。
 # また、量子回路に入力している分布は $N=2^n$ 点に離散化された分布であるため、QAE の推定誤差とは別に $n$ に由来する離散化誤差も存在します。
-# したがって精度を高めるには、QAE の分解能を決める $m$ と、確率分布の離散化精度を決める $n$ の双方を考慮する必要があります。
+# したがって精度を高めるには、QAE の分解能を決める $m$ と、確率分布の離散化精度を決める $n$ の双方を改善する必要があるでしょう。
+
+# %% [markdown]
+# ## まとめ
+#
+# ここでは、[Woerner & Egger (2019)](https://www.nature.com/articles/s41534-019-0130-6) を題材に、QAE を用いた VaR・CVaR 計算を Qamomile で実装しました。
+# 以下に要点をまとめます。
+#
+# * Qamomile の `ripple_carry_add` (2 つの量子レジスタに格納された整数を可逆的に加算する関数) を用いた比較器により、$i \leq \ell$ を判定し、その結果から $P [X \leq \ell]$ を QAE で推定します。
+# * Qamomile 上で状態準備演算子 $\mathcal{A} $ や Grover 演算子 $\mathcal{Q} = \mathcal{A} S_0 \mathcal{A}^\dagger S_\chi$ と逆量子フーリエ変換を組合せることで、QAE を構成しています。
+# * 実際の数値計算では、QPE の位相推定レジスタを $m = 1, 3, 5$ とし、QAE の分解能の違いを調べました。VaR は $m = 1$ の一番粗い推定から大きく改善するものの、必ずしも単調に改善させるわけではないことが確認されました。
+# * CVaR は QAE の誤差に加え、テイラー展開による近似や VaR 推定誤差の影響も受けるため、調べた範囲では改善が見られませんでした。
+# * 最終的な誤差は、QAE の有限の $m$ に依存する推定誤差と、量子ビット数 $n$ からくる離散化誤差が含まれます。
 
 # %% [markdown]
 #
